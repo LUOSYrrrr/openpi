@@ -12,6 +12,8 @@ COPY --from=ghcr.io/astral-sh/uv:0.5.1 /uv /uvx /bin/
 
 WORKDIR /app
 
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirror.aarnet.edu.au/pub/ubuntu/archive|g; s|http://security.ubuntu.com/ubuntu|https://mirror.aarnet.edu.au/pub/ubuntu/archive|g' /etc/apt/sources.list
+
 # Needed because LeRobot uses git-lfs.
 RUN apt-get update && apt-get install -y git git-lfs linux-headers-generic build-essential clang
 

@@ -314,22 +314,73 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
+    # 训练时调用的主入口。每个 batch 调一次，算一次 Flow Matching loss。
+    # ───────────────────────────────────────────────────────────
+    # 架构：类 MoE 设计（论文说 "analogous to a mixture of experts with two mixture elements"）
+    #   - VLM backbone（PaliGemma, 3B 预训练）：处理图像 + 语言
+    #   - Action Expert（300M 从头训）：处理 state + action + time
+    #   - 两套权重独立，但共享 attention；routing 是固定的（按 token 类型分配）
+    # ───────────────────────────────────────────────────────────
+    # 整体流程（9 个阶段，和下面注释的 === N. === 一一对应）：
+    #   ① 拆 observation → 图像 / 语言 token / 机器人状态
+    #   ② 采样 Flow Matching 的噪声 ε 和时间 t（t ~ Beta(1.5, 1)，偏向噪声多的难样本）
+    #   ③ 构造插值点 x_t = t·ε + (1-t)·A，目标速度 u_t = ε - A
+    #   ④ 两套专家分别 embed：
+    #        - VLM backbone embed 图像+语言 → prefix_embs
+    #        - Action Expert embed 状态+x_t+t → suffix_embs（pi0.5 还返回 adarms_cond）
+    #   ⑤ bf16 精度对齐
+    #   ⑥ 拼接 prefix+suffix，构造 prefix-LM 风格的 attention mask
+    #        （图像/语言全连通；状态/动作可看图像语言但反向屏蔽；动作内部双向）
+    #   ⑦ 联合走 PaliGemmaWithExpertModel.forward（两套专家共享 attention，权重独立）
+    #   ⑧ 取最后 H 个动作 token，过 action_out_proj → 预测速度场 v_t
+    #   ⑨ Flow Matching loss = MSE(u_t, v_t)，外部 .mean().backward() 完成一步训练
+    # ───────────────────────────────────────────────────────────
+    # 注意：
+    # - 代码约定 t=0 干净、t=1 噪声；和论文 τ 方向相反（t_code = 1 - τ_paper）
+    # - 真实动作 A 由调用方传入，即参数 `actions`，形状 [B, action_horizon, action_dim]
+    # - noise / time 默认 None 表示内部采样；外部可传固定值用于复现或单元测试
+    # - 训练不用 KV cache（`use_cache=False`），推理路径（sample_actions）才会用
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+        # === 1. 准备输入：把 observation 拆成图像 / 语言 token / 机器人状态 ===
+        # images: list of [B, C, H, W]；lang_tokens: [B, L]；state: [B, state_dim]
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
+          observation, train=True)
 
+        # === 2. 采样 Flow Matching 需要的噪声 ε 和时间 t ===
         if noise is None:
-            noise = self.sample_noise(actions.shape, actions.device)
+            # 形状和 actions 完全一样 [B, horizon, action_dim]；值从 N(0,1) 独立采样
+            noise = self.sample_noise(actions.shape, actions.device)  # ε ~ N(0,1)
 
         if time is None:
-            time = self.sample_time(actions.shape[0], actions.device)
+            # 每条样本一个 t ∈ (0.001, 1]；Beta(1.5, 1) 偏向大 t（噪声多的难样本）
+            time = self.sample_time(actions.shape[0], actions.device)  # t ~ Beta(1.5, 1) 偏向难时刻
 
+        # === 3. 构造 Flow Matching 的插值点 x_t 和真实速度 u_t ===
+        # 注意：代码约定和论文相反！论文是 A^τ = τ·A + (1-τ)·ε (τ=1 干净, τ=0 噪声)
+        #       代码是 x_t = t·ε + (1-t)·A (t=0 干净, t=1 噪声)
+        # 两者数学等价，换元 t_code = 1 - τ_paper 即可互相转换
+        # 代码用这个约定是因为推理时 t 从 1 走到 0，方向和传统 diffusion denoising 一致
+
+        # time_expanded: [B] -> [B, 1, 1]，用于广播到 [B, horizon, action_dim]
         time_expanded = time[:, None, None]
+        # x_t 构造插值点
+        # x_t：t=0 是干净动作 A，t=1 是纯噪声 ε，中间线性插值
         x_t = time_expanded * noise + (1 - time_expanded) * actions
+        # u_t 构造速度目标
+        # u_t = ε - A：从干净动作指向噪声的"真实速度场"
+        # 训练目标：让模型预测的 v_t 逼近 u_t（方向固定，所以 flow matching 比 diffusion 好学）
+        # 推理时 dt<0 从 t=1 走到 t=0：x_{t+dt} = x_t + dt·v，两个负号抵消正好去噪
         u_t = noise - actions
 
+        # === 4. 两套专家分别 embed（类 MoE：VLM backbone + Action Expert）===
+        # prefix（VLM backbone / PaliGemma）：图像 + 语言 token
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        # suffix（Action Expert）：状态 + 噪声动作 x_t + 时间 t
+        # adarms_cond：只有 pi0.5 有，时间经 MLP 变成 adaRMS 的条件信号；pi0 时为 None
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+
+        # === 5. 精度对齐：模型是 bf16 的话，输入 embed 也转成 bf16 ===
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
@@ -337,40 +388,56 @@ class PI0Pytorch(nn.Module):
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
             prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
 
+        # === 6. 拼接 mask，构造两套专家共享的 attention 结构 ===
+        # 在 token 维（dim=1）把 prefix 和 suffix 的 mask 拼起来
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
+        # att_masks 是 1D 的"块分隔标志"，这里展开成 [B, L, L] 的 bool 注意力矩阵
+        # 效果：图像/语言之间全注意力；状态/动作可以看图像/语言，反之不行；动作内部因果
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        # position_ids：按 pad_masks 累加，让 padding 位置不占位置编码
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
-        # Prepare attention masks
+        # 把 bool mask 转成 transformer 要的 4D 加性 mask（True→0，False→-inf）
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
-        # Apply gradient checkpointing if enabled
+        # === 7. 联合 transformer 主 forward（VLM backbone + Action Expert 共享 attention）===
+        # 包一层函数是为了能套 gradient checkpointing（显存换计算）
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
+            # inputs_embeds 是长度 2 的 list：[VLM backbone 输入, Action Expert 输入]
+            # 两套专家权重独立，但共享 attention——每层 K/V 跨专家拼接，所以动作 token 的 Q 能看到图像/语言的 K/V
+            # 返回 ([VLM backbone 输出, Action Expert 输出], past_kv)；训练不需要 cache
             (_, suffix_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
                 past_key_values=None,
                 inputs_embeds=[prefix_embs, suffix_embs],
                 use_cache=False,
-                adarms_cond=[None, adarms_cond],
+                adarms_cond=[None, adarms_cond],  # 只给 Action Expert 注入时间条件（pi0.5）
             )
             return suffix_out
 
+        # 开了 gradient checkpointing 就走 checkpoint 省显存，否则直接调用
         suffix_out = self._apply_checkpoint(
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
 
+        # === 8. 取动作部分的输出，投影回动作维度 ===
+        # suffix_out 前面可能还有 state token（pi0），只要最后 H 个动作 token
         suffix_out = suffix_out[:, -self.config.action_horizon :]
+        # 投影前转 float32，避免 bf16 数值精度不够
         suffix_out = suffix_out.to(dtype=torch.float32)
 
-        # Apply gradient checkpointing to final action projection if enabled
         def action_out_proj_func(suffix_out):
+            # [B, H, expert_width] -> [B, H, action_dim]
             return self.action_out_proj(suffix_out)
 
+        # v_t：模型预测的速度场
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
+        # === 9. Flow Matching loss：让模型预测的速度逼近真实速度 ===
+        # reduction="none" 返回逐元素 loss [B, H, action_dim]，外部可按 mask 加权求均值
         return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()

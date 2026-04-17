@@ -9,6 +9,8 @@
 FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04@sha256:2d913b09e6be8387e1a10976933642c73c840c0b735f0bf3c28d97fc9bc422e0
 COPY --from=ghcr.io/astral-sh/uv:0.5.1 /uv /uvx /bin/
 
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirror.aarnet.edu.au/pub/ubuntu/archive|g; s|http://security.ubuntu.com/ubuntu|https://mirror.aarnet.edu.au/pub/ubuntu/archive|g' /etc/apt/sources.list
+
 RUN apt-get update && \
     apt-get install -y \
     make \

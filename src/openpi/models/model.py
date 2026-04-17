@@ -88,16 +88,16 @@ class Observation(Generic[ArrayT]):
     """
 
     # Images, in [-1, 1] float32.
-    images: dict[str, at.Float[ArrayT, "*b h w c"]]
+    images: dict[str, at.Float[ArrayT, "*b h w c"]] # 多路相机图像，值域 [-1, 1] float32
     # Image masks, with same keys as images.
-    image_masks: dict[str, at.Bool[ArrayT, "*b"]]
+    image_masks: dict[str, at.Bool[ArrayT, "*b"]]# 每路相机的有效性（有些 setup 少相机）
     # Low-dimensional robot state.
-    state: at.Float[ArrayT, "*b s"]
+    state: at.Float[ArrayT, "*b s"] # 机器人低维状态（关节角、夹爪等）
 
     # Tokenized prompt.
-    tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
+    tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None # 语言指令的 token id
     # Tokenized prompt mask.
-    tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None
+    tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None# 语言的 padding mask
 
     # pi0-fast model specific fields.
 
