@@ -1,0 +1,142 @@
+<mxfile host="app.diagrams.net" compressed="false">
+  <diagram name="pi0-compute-layer" compressed="false">
+    <mxGraphModel>
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="2" value="阶段一：各自独立（LayerNorm + Q/K/V 投影）" style="text;fontStyle=1;fontSize=13;fontColor=#1e4d78;fillColor=none;strokeColor=none;" vertex="1" parent="1">
+          <mxGeometry x="20" y="16" width="440" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="3" value="VLM backbone" style="text;fontStyle=3;fontSize=12;fontColor=#1e4d78;fillColor=none;strokeColor=none;align=center;" vertex="1" parent="1">
+          <mxGeometry x="30" y="46" width="160" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="4" value="Action Expert" style="text;fontStyle=3;fontSize=12;fontColor=#7d4e00;fillColor=none;strokeColor=none;align=center;" vertex="1" parent="1">
+          <mxGeometry x="570" y="46" width="160" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="5" value="h_vlm [B, L_vlm, D]" style="rounded=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="30" y="76" width="160" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="6" value="h_exp [B, L_exp, D]" style="rounded=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontStyle=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="570" y="76" width="160" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="7" value="input_layernorm（VLM 独立权重）" style="rounded=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="30" y="160" width="160" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="8" value="input_layernorm（Expert 独立权重）" style="rounded=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="570" y="160" width="160" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="9" value="q/k/v_proj（VLM 独立权重）Q_v K_v V_v" style="rounded=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="30" y="244" width="160" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="10" value="q/k/v_proj（Expert 独立权重）Q_e K_e V_e" style="rounded=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="570" y="244" width="160" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="11" value="阶段二：合并共享（Attention 计算）" style="text;fontStyle=1;fontSize=13;fontColor=#2d6e2d;fillColor=none;strokeColor=none;" vertex="1" parent="1">
+          <mxGeometry x="20" y="316" width="360" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="12" value="CONCAT: Q=[Q_v;Q_e]  K=[K_v;K_e]  V=[V_v;V_e]" style="rounded=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="230" y="346" width="300" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="13" value="RoPE 位置编码（两专家共享）" style="rounded=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="255" y="414" width="250" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="14" value="Attention(Q, K, V) + att_2d_masks" style="rounded=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="240" y="478" width="280" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="15" value="阶段三：各自独立（o_proj + FFN）" style="text;fontStyle=1;fontSize=13;fontColor=#7d4e00;fillColor=none;strokeColor=none;" vertex="1" parent="1">
+          <mxGeometry x="20" y="540" width="340" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="16" value="SPLIT（按 L_vlm / L_exp 长度切回）" style="rounded=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="240" y="568" width="280" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="17" value="o_proj（VLM 独立权重）" style="rounded=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="30" y="640" width="160" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="18" value="第一次残差: h_vlm + attn_out" style="rounded=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="30" y="704" width="160" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="19" value="post_norm + MLP（VLM 独立权重）" style="rounded=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="30" y="768" width="160" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="20" value="第二次残差 + MLP 输出" style="rounded=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="30" y="832" width="160" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="21" value="h_vlm 新 [B, L_vlm, D]" style="rounded=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="30" y="896" width="160" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="22" value="o_proj（Expert 独立权重）" style="rounded=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="570" y="640" width="160" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="23" value="第一次残差: h_exp + attn_out" style="rounded=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="570" y="704" width="160" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="24" value="post_norm + MLP（Expert 独立权重）" style="rounded=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="570" y="768" width="160" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="25" value="第二次残差 + MLP 输出" style="rounded=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="570" y="832" width="160" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="26" value="h_exp 新 [B, L_exp, D]" style="rounded=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontStyle=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="570" y="896" width="160" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="e1" edge="1" source="5" target="7" parent="1" style="strokeColor=#6c8ebf;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" edge="1" source="7" target="9" parent="1" style="strokeColor=#6c8ebf;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3" edge="1" source="6" target="8" parent="1" style="strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e4" edge="1" source="8" target="10" parent="1" style="strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e5" edge="1" source="9" target="12" parent="1" style="strokeColor=#b85450;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e6" edge="1" source="10" target="12" parent="1" style="strokeColor=#b85450;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e7" edge="1" source="12" target="13" parent="1" style="strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e8" edge="1" source="13" target="14" parent="1" style="strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e9" edge="1" source="14" target="16" parent="1" style="strokeColor=#b85450;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e10" edge="1" source="16" target="17" parent="1" style="strokeColor=#6c8ebf;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e11" edge="1" source="16" target="22" parent="1" style="strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e12" edge="1" source="17" target="18" parent="1" style="strokeColor=#6c8ebf;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e13" edge="1" source="18" target="19" parent="1" style="strokeColor=#6c8ebf;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e14" edge="1" source="19" target="20" parent="1" style="strokeColor=#6c8ebf;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e15" edge="1" source="20" target="21" parent="1" style="strokeColor=#6c8ebf;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e16" edge="1" source="22" target="23" parent="1" style="strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e17" edge="1" source="23" target="24" parent="1" style="strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e18" edge="1" source="24" target="25" parent="1" style="strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e19" edge="1" source="25" target="26" parent="1" style="strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

@@ -366,6 +366,16 @@ class PI0Pytorch(nn.Module):
         time_expanded = time[:, None, None]
         # x_t 构造插值点
         # x_t：t=0 是干净动作 A，t=1 是纯噪声 ε，中间线性插值
+        # x_1.0  shape=[B, 50, action_dim]  ← 纯噪声，50 帧都是乱的
+        #   ↓ 模型预测速度 v，走一步
+        # x_0.9  shape=[B, 50, action_dim]  ← 50 帧一起变清晰一点点
+        #   ↓
+        # x_0.8  shape=[B, 50, action_dim]
+        #   ↓
+        # ...
+        #   ↓
+        # x_0.0  shape=[B, 50, action_dim]  ← 最终干净的 50 步动作序列
+
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         # u_t 构造速度目标
         # u_t = ε - A：从干净动作指向噪声的"真实速度场"
@@ -394,7 +404,10 @@ class PI0Pytorch(nn.Module):
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
         # att_masks 是 1D 的"块分隔标志"，这里展开成 [B, L, L] 的 bool 注意力矩阵
-        # 效果：图像/语言之间全注意力；状态/动作可以看图像/语言，反之不行；动作内部因果
+        # 可见性规则（块编号越大能看越多，只能往前看）：
+        #   块0（图像/语言）：只能看自己，看不到 state/action
+        #   块1（state）    ：能看图像/语言，看不到 action
+        #   块2（action）   ：能看图像/语言 + state + action（action 内部双向全注意力）
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         # position_ids：按 pad_masks 累加，让 padding 位置不占位置编码
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
@@ -440,24 +453,30 @@ class PI0Pytorch(nn.Module):
         # reduction="none" 返回逐元素 loss [B, H, action_dim]，外部可按 mask 加权求均值
         return F.mse_loss(u_t, v_t, reduction="none")
 
+    # @torch.no_grad()：推理不需要梯度，省显存、省计算
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = observation.state.shape[0]
         if noise is None:
+            # 初始化纯噪声 x_1 ~ N(0,1)，shape=[B, action_horizon, action_dim]
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
+        # === 第一阶段：VLM 只跑一次，把图像+语言的 KV 缓存下来 ===
+        # 推理时 VLM 的输入（图像/语言）不变，没必要每步都重新算
+        # use_cache=True 让 transformers 把每层的 K/V 存进 past_key_values
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
-        # Compute image and language key value cache
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
+        # inputs_embeds=[prefix_embs, None]：只跑 VLM，Expert 输入为 None
+        # 返回的 past_key_values 是所有层的 K/V cache，后面 10 步复用
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
@@ -466,13 +485,17 @@ class PI0Pytorch(nn.Module):
             use_cache=True,
         )
 
+        # === 第二阶段：Action Expert 迭代去噪 num_steps 步（默认 10 步）===
+        # dt=-0.1，每步让 time 从 1.0 走到 0.0，即 x_1 → x_0.9 → ... → x_0
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
-        x_t = noise
+        x_t = noise                                          # 从纯噪声 x_1 出发
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
-        while time >= -dt / 2:
-            expanded_time = time.expand(bsize)
+        while time >= -dt / 2:                              # 循环直到 time ≈ 0
+            expanded_time = time.expand(bsize)              # 标量 → [B]，每样本同一个 t
+            # denoise_step：只跑 Action Expert，复用 VLM 的 past_key_values
+            # 输入当前带噪动作 x_t 和时刻 t，输出预测速度 v_t
             v_t = self.denoise_step(
                 state,
                 prefix_pad_masks,
@@ -481,9 +504,13 @@ class PI0Pytorch(nn.Module):
                 expanded_time,
             )
 
-            # Euler step - use new tensor assignment instead of in-place operation
+            # Euler 积分一步：x_{t+dt} = x_t + dt * v_t
+            # dt 为负，所以实际上是往 t 减小的方向走（去噪方向）
             x_t = x_t + dt * v_t
             time += dt
+
+        # x_t 此时是 x_0，即完全去噪的 50 步动作序列 [B, action_horizon, action_dim]
+        # 直接发给机器人执行
         return x_t
 
     def denoise_step(
@@ -495,22 +522,40 @@ class PI0Pytorch(nn.Module):
         timestep,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
+        # === 1. 把 state + x_t + timestep 编码成 suffix token 序列 ===
+        # suffix_embs: [B, L_suf, expert_width]，包含 state token + 50 个 action token
+        # timestep 通过 sine-cosine 编码后融入每个 action token
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
 
+        # === 2. 构造推理时的 attention mask ===
+        # 推理时 prefix（图像/语言）的 KV 已经缓存在 past_key_values 里
+        # 但 attention mask 仍然需要告诉模型 suffix 的每个 token 能看到 prefix 的哪些位置
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
         prefix_len = prefix_pad_masks.shape[1]
 
+        # prefix_pad_2d_masks: [B, suffix_len, prefix_len]
+        # suffix 的每个 token 都能看到 prefix 的全部有效位置（padding 除外）
         prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
 
+        # suffix 内部的可见性：state 看不到 action，action 内部双向全注意力
         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
 
+        # 拼成完整的 2D mask：[B, suffix_len, prefix_len + suffix_len]
+        # 列方向：前半段对应 prefix（KV cache），后半段对应 suffix 自身
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
 
+        # === 3. 计算 position_ids ===
+        # suffix token 的位置编号要接在 prefix 之后，保证 RoPE 的相对距离正确
+        # prefix_offsets：每条样本 prefix 里有效 token 的数量
+        # suffix 的 position_ids 从 prefix 结束的位置继续累加
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
-        # Prepare attention masks
+        # === 4. Action Expert forward（复用 VLM 的 KV cache）===
+        # inputs_embeds=[None, suffix_embs]：只跑 Action Expert，不重跑 VLM
+        # past_key_values：VLM 预先算好的图像/语言 KV，每层 attention 时自动拼到前面
+        # 这样 Expert 能"看到"图像语言，但 VLM 不需要重复计算，节省 10x 推理时间
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
@@ -523,7 +568,12 @@ class PI0Pytorch(nn.Module):
             adarms_cond=[None, adarms_cond],
         )
 
+        # === 5. 取 action token 的输出，投影成速度 v_t ===
+        # outputs_embeds[1] 是 Action Expert 的输出 [B, L_suf, expert_width]
+        # L_suf = state(1) + action(50)，只取最后 50 个 action token
         suffix_out = outputs_embeds[1]
-        suffix_out = suffix_out[:, -self.config.action_horizon :]
+        suffix_out = suffix_out[:, -self.config.action_horizon :]   # [B, 50, expert_width]
         suffix_out = suffix_out.to(dtype=torch.float32)
+        # action_out_proj: [B, 50, expert_width] -> [B, 50, action_dim]
+        # 返回的就是 v_t，即"当前 x_t 应该往哪个方向走"
         return self.action_out_proj(suffix_out)
