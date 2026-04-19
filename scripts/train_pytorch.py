@@ -307,17 +307,27 @@ def log_memory_usage(device, step, phase="unknown"):
 
 
 def train_loop(config: _config.TrainConfig):
+    # ============================================================
+    # 训练主循环：从一个 TrainConfig 出发，搭好 DDP/数据/模型/优化器，
+    # 然后进 while-loop 反复 forward + backward + step + save_checkpoint。
+    # 单卡和多卡（torchrun）走同一份代码，差别只在 setup_ddp 和 DistributedSampler。
+    # ============================================================
     use_ddp, local_rank, device = setup_ddp()
+    # 判断是否主进程（DDP 只在 rank=0 上打日志、保存 checkpoint、写 wandb）
     is_main = (not use_ddp) or (dist.get_rank() == 0)
+    # 每张卡的随机种子 = config.seed + local_rank，保证各 rank 采样不同
     set_seed(config.seed, local_rank)
 
     # Initialize checkpoint directory and wandb
+    # 初始化 checkpoint 目录和 wandb（判断是否续训、是否覆盖）
     resuming = False
     if config.resume:
         # Find checkpoint directory based on experiment name
+        # 按实验名找 checkpoint 目录，决定从哪一步恢复
         exp_checkpoint_dir = config.checkpoint_dir
         if exp_checkpoint_dir.exists():
             # Use validation to find the latest working checkpoint
+            # 扫目录下的数字子目录，取最大的作为 latest_step
             latest_step = get_latest_checkpoint_step(exp_checkpoint_dir)
             if latest_step is not None:
                 resuming = True
@@ -329,26 +339,32 @@ def train_loop(config: _config.TrainConfig):
         else:
             raise FileNotFoundError(f"Experiment checkpoint directory {exp_checkpoint_dir} does not exist for resume")
     elif config.overwrite and config.checkpoint_dir.exists():
+        # 指定了 --overwrite 则整个目录删掉重训
         shutil.rmtree(config.checkpoint_dir)
         logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
 
     # Create checkpoint directory with experiment name
+    # 建立以实验名命名的 checkpoint 目录
     if not resuming:
         # For new runs, create experiment-specific checkpoint directory
+        # 新任务：创建专属目录
         exp_checkpoint_dir = config.checkpoint_dir
         exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
         logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
     else:
         # For resume, checkpoint_dir is already set to the experiment directory
+        # 续训：复用已存在的目录
         logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
 
     # Initialize wandb (only on main process)
+    # 只在主进程初始化 wandb，避免多卡重复 run
     if is_main:
         init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
     # Build data loader using the unified data loader
     # Calculate effective batch size per GPU for DDP
     # For N GPUs, each GPU should get batch_size/N samples, so total across all GPUs is batch_size
+    # 计算每卡有效 batch：全局 batch_size 在 N 张卡上切分，每卡拿 batch_size/N
     world_size = torch.distributed.get_world_size() if use_ddp else 1
     effective_batch_size = config.batch_size // world_size
     logging.info(
@@ -356,25 +372,33 @@ def train_loop(config: _config.TrainConfig):
     )
 
     # Pass the original batch size to data loader - it will handle DDP splitting internally
+    # data_loader 内部通过 DistributedSampler 自动按 rank 分片，所以外面传全局 batch_size
+    # build_datasets 里会跑完整条 transform pipeline（RepackTransform→LiberoInputs→Normalize→Tokenize→Pad）
     loader, data_config = build_datasets(config)
 
     # Log sample images to wandb on first batch
+    # 首个 batch 抽 5 张图上传 wandb，直观核对数据是否正常（是否旋转、resize、归一化对）
     if is_main and config.wandb_enabled and not resuming:
         # Create a separate data loader for sample batch to avoid consuming the main loader
+        # 单独建一个 loader 抽样，避免消耗主 loader 的第一个 batch
         sample_data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
         sample_batch = next(iter(sample_data_loader))
         # Convert observation and actions to torch tensors
+        # 拿出 (observation, actions) 元组并展平成 dict
         observation, actions = sample_batch
         sample_batch = observation.to_dict()
         sample_batch["actions"] = actions
 
         # Create sample images for wandb
+        # 拼可视化图：横向拼接所有相机视角（base + wrist），方便对比
         images_to_log = []
         # Get batch size from the first image tensor
+        # 从第一个 image tensor 拿到 batch size
         batch_size = next(iter(sample_batch["image"].values())).shape[0]
         for i in range(min(5, batch_size)):
             # Concatenate all camera views horizontally for this batch item
             # Convert from NCHW to NHWC format for wandb
+            # PyTorch 默认 NCHW，wandb.Image 需要 NHWC，所以 permute(1,2,0)
             img_concatenated = torch.cat([img[i].permute(1, 2, 0) for img in sample_batch["image"].values()], axis=1)
             img_concatenated = img_concatenated.cpu().numpy()
             images_to_log.append(wandb.Image(img_concatenated))
@@ -382,6 +406,7 @@ def train_loop(config: _config.TrainConfig):
         wandb.log({"camera_views": images_to_log}, step=0)
 
         # Clear sample batch from memory aggressively
+        # 可视化用完立刻释放显存，避免占用训练所需空间
         del sample_batch, observation, actions, images_to_log, img_concatenated
         del sample_data_loader  # Also delete the sample data loader
         gc.collect()
@@ -390,8 +415,10 @@ def train_loop(config: _config.TrainConfig):
         logging.info("Cleared sample batch and data loader from memory")
 
     # Build model
+    # 构建模型：确保 config.model 是 Pi0Config（必要时从基类字段重建）
     if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
         # Convert dataclass to Pi0Config if needed
+        # 保留字段同时把类型换成 Pi0Config（用 PyTorch 精度覆盖 dtype）
         model_cfg = openpi.models.pi0_config.Pi0Config(
             dtype=config.pytorch_training_precision,
             action_dim=config.model.action_dim,
@@ -404,10 +431,13 @@ def train_loop(config: _config.TrainConfig):
     else:
         model_cfg = config.model
         # Update dtype to match pytorch_training_precision
+        # 训练精度以 pytorch_training_precision 为准（覆盖 config 里声明的 dtype）
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
+    # 真正实例化 PI0Pytorch（pi0 / pi0.5 同一个类，由 model_cfg.pi05 字段切换分支）
     model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
 
+    # 梯度检查点（gradient checkpointing）：backward 时重跑 forward 换显存
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
         model.gradient_checkpointing_enable()
@@ -417,18 +447,22 @@ def train_loop(config: _config.TrainConfig):
         logging.info("Gradient checkpointing is not supported for this model")
 
     # Log initial memory usage after model creation
+    # 模型建好后先记一次显存占用，方便排查是否模型本体就爆显存
     if is_main and torch.cuda.is_available():
         log_memory_usage(device, 0, "after_model_creation")
 
     # Enable memory optimizations for large-scale training
+    # 8 卡以上启用大规模训练的 cudnn/TF32/内存分配优化
     if world_size >= 8:
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         # Set memory allocation configuration
+        # 显存碎片整理：限制单次分配上限、允许按需扩展
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
         logging.info("Enabled memory optimizations for 8+ GPU training")
 
+    # 用 DDP 包一层：每卡独立 forward/backward，梯度通过 all-reduce 同步
     if use_ddp:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
@@ -439,6 +473,7 @@ def train_loop(config: _config.TrainConfig):
         )
 
     # Load weights from weight_loader if specified (for fine-tuning)
+    # fine-tune 入口：从预训练 checkpoint 的 safetensors 加载权重
     if config.pytorch_weight_path is not None:
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
@@ -449,12 +484,14 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
     # Optimizer + learning rate schedule from config
+    # 从 config 读出 LR schedule 的四要素：warmup 步数、峰值 LR、衰减总步数、终止 LR
     warmup_steps = config.lr_schedule.warmup_steps
     peak_lr = config.lr_schedule.peak_lr
     decay_steps = config.lr_schedule.decay_steps
     end_lr = config.lr_schedule.decay_lr
 
     # Create optimizer with config parameters
+    # AdamW 优化器：pi0/pi0.5 使用 config.optimizer 提供的 b1/b2/eps/weight_decay
     optim = torch.optim.AdamW(
         model.parameters(),
         lr=peak_lr,
@@ -464,24 +501,30 @@ def train_loop(config: _config.TrainConfig):
     )
 
     # Load checkpoint if resuming
+    # 续训则把模型权重、优化器状态、global_step 一并从 checkpoint 恢复
     global_step = 0
     if resuming:
         global_step = load_checkpoint(model, optim, config.checkpoint_dir, device)
         logging.info(f"Resumed training from step {global_step}")
 
+    # LR 调度：前 warmup_steps 做线性升温 → 之后做 cosine 衰减到 end_lr
     def lr_schedule(step: int):
         if step < warmup_steps:
             # Match JAX behavior: start from peak_lr / (warmup_steps + 1)
+            # 和 JAX 版实现对齐：从 peak_lr/(warmup+1) 起步，线性升到 peak_lr
             init_lr = peak_lr / (warmup_steps + 1)
             return init_lr + (peak_lr - init_lr) * step / warmup_steps
         # cosine decay
+        # 过了 warmup 之后用余弦曲线从 peak_lr 衰减到 end_lr
         progress = min(1.0, (step - warmup_steps) / max(1, decay_steps - warmup_steps))
         cos = 0.5 * (1 + np.cos(np.pi * progress))
         return end_lr + (peak_lr - end_lr) * cos
 
+    # 进入训练模式（开 dropout 等），开始计时
     model.train()
     start_time = time.time()
     infos = []  # Collect stats over log interval
+    # infos：在 log_interval 区间内累积每步的 loss/lr/grad_norm，打日志时取平均
     if is_main:
         logging.info(
             f"Running on: {platform.node()} | world_size={torch.distributed.get_world_size() if use_ddp else 1}"
@@ -500,6 +543,7 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Training precision: {model_cfg.dtype}")
 
     # Training loop - iterate until we reach num_train_steps
+    # 主循环：跑到 num_train_steps 为止（不是跑几个 epoch）
     pbar = (
         tqdm.tqdm(total=config.num_train_steps, initial=global_step, desc="Training", disable=not is_main)
         if is_main
@@ -508,54 +552,68 @@ def train_loop(config: _config.TrainConfig):
 
     while global_step < config.num_train_steps:
         # Set epoch for distributed training
+        # DDP 下每个 epoch 要告诉 DistributedSampler 当前 epoch，保证各卡打乱顺序同步
         if use_ddp and hasattr(loader, "set_epoch"):
             loader.set_epoch(global_step // len(loader))
 
         for observation, actions in loader:
             # Check if we've reached the target number of steps
+            # 达到目标步数立刻跳出，哪怕当前 epoch 还没走完
             if global_step >= config.num_train_steps:
                 break
 
             # The unified data loader returns (observation, actions) tuple
+            # data_loader 已经跑完 transform pipeline，返回的是 (Observation dataclass, actions tensor)
+            # jax.tree.map 把 Observation 里所有嵌套 tensor 都 .to(device)
             observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
             actions = actions.to(torch.float32)  # noqa: PLW2901
             actions = actions.to(device)  # noqa: PLW2901
 
             # Update LR
+            # 每步按 lr_schedule 更新学习率（所有 param group 共享）
             for pg in optim.param_groups:
                 pg["lr"] = lr_schedule(global_step)
 
             # Forward pass
+            # 调用 PI0Pytorch.forward(obs, actions) → 返回 per-element flow matching MSE loss
             losses = model(observation, actions)
             # Ensure losses is a tensor and handle different return types
+            # 容错：forward 返回 list/tuple/标量时都规整为 Tensor
             if isinstance(losses, list | tuple):
                 losses = torch.stack(losses)
             elif not isinstance(losses, torch.Tensor):
                 losses = torch.tensor(losses, device=device, dtype=torch.float32)
 
+            # 把 (B, horizon, action_dim) 的 element-wise loss 平均成标量
             loss = losses.mean()
 
             # Backward pass
+            # 反向传播：开了 gradient checkpointing 时会重跑 forward
             loss.backward()
 
             # Log memory usage after backward pass
+            # 前 5 步记录一次显存峰值，方便诊断 OOM
             if global_step < 5 and is_main and torch.cuda.is_available():
                 log_memory_usage(device, global_step, "after_backward")
 
             # Gradient clipping
+            # 梯度裁剪：防止 flow matching 早期 loss 大时梯度爆炸（clip_gradient_norm 默认 1.0）
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
 
             # Optimizer step
+            # AdamW 更新参数，然后立刻清零梯度
             optim.step()
             optim.zero_grad(set_to_none=True)
 
             # Clear gradients more aggressively
+            # 再手动把 .grad 设 None，进一步释放显存（比 zero_grad 更彻底）
             for param in model.parameters():
                 if param.grad is not None:
                     param.grad.detach_()
                     param.grad = None
 
             # Collect stats
+            # 主进程累积这一步的 loss / lr / grad_norm，log_interval 时取平均输出
             if is_main:
                 infos.append(
                     {
@@ -565,10 +623,12 @@ def train_loop(config: _config.TrainConfig):
                     }
                 )
 
+            # 每 log_interval 步打一次日志（终端 + wandb）
             if is_main and (global_step % config.log_interval == 0):
                 elapsed = time.time() - start_time
 
                 # Average stats over log interval
+                # 对区间内 loss / lr 求平均（减少单步噪声）
                 avg_loss = sum(info["loss"] for info in infos) / len(infos)
                 avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
 
@@ -586,6 +646,7 @@ def train_loop(config: _config.TrainConfig):
                 )
 
                 # Log to wandb
+                # 把平均指标也发到 wandb dashboard
                 if config.wandb_enabled and len(infos) > 0:
                     log_payload = {
                         "loss": avg_loss,
@@ -599,12 +660,15 @@ def train_loop(config: _config.TrainConfig):
 
                 start_time = time.time()
                 infos = []  # Reset stats collection
+                # 清空 infos，开始新一轮区间累积
 
             global_step += 1
             # Save checkpoint using the new mechanism
+            # 按 save_interval 原子化保存 checkpoint：tmp 目录写完再 rename，避免中断损坏
             save_checkpoint(model, optim, global_step, config, is_main, data_config)
 
             # Update progress bar
+            # 更新 tqdm 进度条，显示当前 loss / lr / step
             if pbar is not None:
                 pbar.update(1)
                 pbar.set_postfix(
@@ -612,6 +676,7 @@ def train_loop(config: _config.TrainConfig):
                 )
 
     # Close progress bar
+    # 训练结束：关进度条、结束 wandb run、清理 DDP 进程组
     if pbar is not None:
         pbar.close()
 

@@ -131,13 +131,62 @@ def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
     """Create a dataset for training."""
+    # ============================================================
+    # 从 data_config 出发，构造一个"支持随机访问"的 Dataset 对象。
+    # 这里只打开底层 LeRobotDataset，不套 RepackTransform/Normalize 等训练 transform
+    # （那些在 transform_dataset() 外层再包一次）。本函数的三件事：
+    #   1. 打开底层 LeRobotDataset（从 HF Hub 下载 meta、parquet 按需下载）
+    #   2. 配置 delta_timestamps —— 让 __getitem__(i) 返回未来 horizon 帧的 action chunk
+    #   3. 可选：把 task_index 映射成自然语言 prompt（tokenizer 需要字符串）
+    #
+    # 关于 LeRobot 数据集格式（详见 PI0_DATA_PIPELINE_NOTES.md §1）：
+    #   - repo_id 如 "physical-intelligence/libero" 对应 HF Hub 上的数据集
+    #   - 本地缓存在 ~/.cache/huggingface/lerobot/<repo_id>/（不是标准 hub 路径）
+    #   - meta/ 目录 200KB 左右（info.json / episodes.jsonl / tasks.jsonl / stats.json）
+    #   - data/chunk-XXX/episode_XXXXXX.parquet 才是真实样本（LIBERO 平均 27MB/episode）
+    #   - 每个 parquet：行=帧、列=字段（image/wrist_image 是 PNG bytes, state/actions 是 f32 数组）
+    # ============================================================
+
+    # repo_id = HF Hub 上 LeRobot 数据集的 ID（如 "physical-intelligence/libero"）
+    # 或本地数据集目录名。通过 _CONFIGS 里的 TrainConfig.data.repo_id 注入。
     repo_id = data_config.repo_id
     if repo_id is None:
+        # 没配数据集直接报错（避免训练启动后、加载权重后才挂掉浪费时间）
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
+        # 调试分支：repo_id="fake" 时返回 1024 个随机样本，不加载任何真数据
+        # 用于跑通代码链路、验证 shape 对齐（比如 config_name=debug 时）
         return FakeDataset(model_config, num_samples=1024)
 
+    # ---- 步骤 1：加载数据集元信息 ----
+    # LeRobotDatasetMetadata 只读 ~/.cache/huggingface/lerobot/<repo_id>/meta/ 下的 4 个 json/jsonl，
+    # 总共几百 KB，首次调用会从 HF Hub 拉下来（很快）。不触碰任何 parquet 文件。
+    #
+    # 用到的两个字段：
+    #   dataset_meta.fps    采样频率（LIBERO = 10 Hz，即每秒 10 帧）
+    #                       → 决定 delta_timestamps 里的时间间隔（见步骤 2）
+    #   dataset_meta.tasks  {task_index: "natural language prompt"} 字典
+    #                       → LIBERO 有 40 个 task，task_index=0 是
+    #                         "put the white mug on the left plate and..."
+    #                       → PromptFromLeRobotTask 查这张表（见步骤 3）
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+
+    # ---- 步骤 2：构造真正的 LeRobotDataset ----
+    # LeRobotDataset 支持懒加载：首次 ds[i] 才下载对应的 episode_XXXXXX.parquet
+    # （首次 __getitem__ 可能有几十 MB 下载延迟，之后命中本地缓存毫秒级）。
+    #
+    # 关键是 delta_timestamps 参数 —— 让 __getitem__(i) 不只返回第 i 帧，
+    # 而是返回"未来若干帧的 action chunk"，这正是 pi0 模型需要的格式：
+    #
+    #   LIBERO: fps=10, action_horizon=10
+    #   delta_timestamps = {"actions": [0/10, 1/10, 2/10, ..., 9/10]}
+    #                    = {"actions": [0.0, 0.1, 0.2, ..., 0.9]}  # 未来 1 秒
+    #
+    # 这样 ds[i]['actions'] 的 shape 从 (7,) 变成 (10, 7) —— 一个 1 秒的 action chunk。
+    # 每次训练用一个 action chunk 作为预测目标。
+    #
+    # action_sequence_keys 由 DataConfig 控制，通常就是 ["actions"]（只切 action）；
+    # 若要切其他时间序列（如 state 历史），可以加进来。
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
@@ -145,9 +194,19 @@ def create_torch_dataset(
         },
     )
 
+    # ---- 步骤 3：（可选）把 task_index 转成自然语言 prompt ----
+    # LeRobot parquet 的 task_index 列是整数（节省空间），但 pi0 的 Paligemma Tokenizer
+    # 需要字符串。PromptFromLeRobotTask 这层 transform 做查表：
+    #   data["task_index"] == 0  →  data["prompt"] = "put the white mug on the left plate..."
+    #
+    # 这层必须在这里嵌入 Dataset 内部（用 TransformedDataset 包一层），
+    # 而不是堆到外层 transform_dataset()。原因是：prompt 文本要依赖 dataset_meta（只有这里知道），
+    # 后续 transform 链只要拿到字符串 prompt 就能处理，不用再传 meta。
+    # LIBERO 的 TrainConfig 里 prompt_from_task=True，所以这层会生效。
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
+    # 返回的 dataset 支持 __getitem__(i) 和 __len__()，上层再套 transform_dataset 补齐其他 transform
     return dataset
 
 
