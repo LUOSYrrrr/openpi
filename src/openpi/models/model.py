@@ -215,11 +215,11 @@ class BaseModelConfig(abc.ABC):
     """
 
     # Action space dimension.
-    action_dim: int
+    action_dim: int # action 空间维度
     # Action sequence length.
-    action_horizon: int
+    action_horizon: int # 预测的动作序列长度
     # Tokenized prompt maximum length.
-    max_token_len: int
+    max_token_len: int # prompt tokenize 后的最大 token 数
 
     @property
     @abc.abstractmethod

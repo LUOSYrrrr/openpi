@@ -365,6 +365,7 @@ def train_loop(config: _config.TrainConfig):
     # Calculate effective batch size per GPU for DDP
     # For N GPUs, each GPU should get batch_size/N samples, so total across all GPUs is batch_size
     # 计算每卡有效 batch：全局 batch_size 在 N 张卡上切分，每卡拿 batch_size/N
+    #world_size = 整个分布式训练中的总进程数（= 总 GPU 数）
     world_size = torch.distributed.get_world_size() if use_ddp else 1
     effective_batch_size = config.batch_size // world_size
     logging.info(

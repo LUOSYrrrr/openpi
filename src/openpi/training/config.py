@@ -64,38 +64,47 @@ class AssetsConfig:
 @dataclasses.dataclass(frozen=True)
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
-    repo_id: str | None = None
+    repo_id: str | None = None# LeRobot 数据集 ID
     # Directory within the assets directory containing the data assets.
-    asset_id: str | None = None
+    asset_id: str | None = None # 数据资产目录
     # Contains precomputed normalization stats. If None, normalization will not be performed.
-    norm_stats: dict[str, _transforms.NormStats] | None = None
+    norm_stats: dict[str, _transforms.NormStats] | None = None # 归一化统计量（均值、方差、分位数）
 
     # Used to adopt the inputs from a dataset specific format to a common format
     # which is expected by the data transforms.
+     # 键名重映射 transform
     repack_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
     # Data transforms, typically include robot specific transformations. Will be applied
     # before the data is normalized. See `model.Observation` and `model.Actions` to learn about the
     # normalized data.
+    # 机器人特定 transform
     data_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
     # Model specific transforms. Will be applied after the data is normalized.
+     # 模型特定 transform（tokenize、resize等）
     model_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
+    # 归一化方式
     use_quantile_norm: bool = False
 
     # Names of keys that will be used by the data loader to generate the action sequence. The length of the
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
     # LeRobot dataset is using different keys to represent the action.
+    # action 对应的键
     action_sequence_keys: Sequence[str] = ("actions",)
 
     # If true, will use the LeRobot dataset task to define the prompt.
+    # 是否从任务描述生成 prompt
     prompt_from_task: bool = False
 
     # Only used for RLDS data loader (ie currently only used for DROID).
+    # DROID 专用
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
+    # DROID 专用
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
-    datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+    # 多数据集混合
+    atasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
 
 
 class GroupFactory(Protocol):
@@ -465,73 +474,96 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
-    name: tyro.conf.Suppress[str]
+    name: tyro.conf.Suppress[str]#配置名（如 pi0_aloha），必须唯一
     # Project name.
-    project_name: str = "openpi"
+    project_name: str = "openpi"#"	wandb 的 project 名
     # Experiment name. Will be used to name the metadata and checkpoint directories.
-    exp_name: str = tyro.MISSING
+    exp_name: str = tyro.MISSING#本次运行名，决定 checkpoint 和 metadata 目录
 
+    #2. 模型
     # Defines the model config. Some attributes (action_dim, action_horizon, and max_token_len) are shared by all models
     # -- see BaseModelConfig. Specific model implementations (e.g., Pi0Config) inherit from BaseModelConfig and may
     # define additional attributes.
+    #模型结构配置（π0 / π0.5 / π0-FAST）
     model: _model.BaseModelConfig = dataclasses.field(default_factory=pi0_config.Pi0Config)
-
     # A weight loader can optionally load (possibly partial) weights from disk after the model is initialized.
+    #加载预训练权重的策略（JAX 用）
     weight_loader: weight_loaders.WeightLoader = dataclasses.field(default_factory=weight_loaders.NoOpWeightLoader)
 
     # Optional path to a PyTorch checkpoint to load weights from.
+    #PyTorch checkpoint 路径（可选）
     pytorch_weight_path: str | None = None
 
     # Precision for PyTorch training.
+    #PyTorch 训练精度
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
 
+    #3. 优化器 & 学习率
+    #学习率调度（默认余弦衰减）
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
+    #优化器（默认 AdamW）
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
+    #	EMA（指数移动平均）衰减率
     ema_decay: float | None = 0.99
 
     # Specifies which weights should be frozen.
+    #冻结哪些权重（如冻结 vision backbone）
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
 
+    #4. 数据
     # Determines the data to be trained on.
+    #数据集工厂（指定用哪个数据集：aloha / libero / droid 等）
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
 
+    #5. 文件路径
     # Base directory for config assets (e.g., norm stats).
+    #资产目录（存归一化统计等）
     assets_base_dir: str = "./assets"
     # Base directory for checkpoints.
+    #checkpoint 保存根目录
     checkpoint_base_dir: str = "./checkpoints"
 
+    #6. 训练循环控制
     # Random seed that will be used by random generators during training.
-    seed: int = 42
+    seed: int = 42 #随机种子
     # Global batch size.
+    #全局 batch size（会被所有 GPU 瓜分）
     batch_size: int = 32
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
+    #	PyTorch DataLoader 的 worker 进程数
     num_workers: int = 2
     # Number of train steps (batches) to run.
+    #总训练步数
     num_train_steps: int = 30_000
 
+    #7. 日志 & Checkpoint
     # How often (in steps) to log training metrics.
-    log_interval: int = 100
+    log_interval: int = 100 #每多少步打印/上传一次 loss
     # How often (in steps) to save checkpoints.
-    save_interval: int = 1000
+    save_interval: int = 1000 # 每多少步存一次 checkpoint
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
-    keep_period: int | None = 5000
+    keep_period: int | None = 5000 #每 N 步的 checkpoint 永久保留（其他会被清理）
 
     # If true, will overwrite the checkpoint directory if it already exists.
-    overwrite: bool = False
+    overwrite: bool = False#是否覆盖已有 checkpoint 目录
     # If true, will resume training from the last checkpoint.
-    resume: bool = False
+    resume: bool = False#是否从最后一个 checkpoint 继续
 
+    #8. 实验追踪 & 部署
     # If true, will enable wandb logging.
-    wandb_enabled: bool = True
+    wandb_enabled: bool = True#是否启用 wandb 日志
 
     # Used to pass metadata to the policy server.
+    #推理时传给 policy server 的元信息（如 robot reset pose）
     policy_metadata: dict[str, Any] | None = None
 
+    #9. 分布式训练
     # If the value is greater than 1, FSDP will be enabled and shard across number of specified devices; overall
     # device memory will be reduced but training could potentially be slower.
     # eg. if total device is 4 and fsdp devices is 2; then the model will shard to 2 devices and run
     # data parallel between 2 groups of devices.
+    #FSDP 模型并行设备数；>1 时启用（切分模型减少显存）
     fsdp_devices: int = 1
 
     @property
