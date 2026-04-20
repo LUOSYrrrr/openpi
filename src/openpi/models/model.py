@@ -87,6 +87,15 @@ class Observation(Generic[ArrayT]):
     that should be produced by the data transforms.
     """
 
+        
+    # 字母	含义	LIBERO 下的典型值
+    # *b	batch 维度(* 表示可变数量,0/1/多维都行)	训练时一般是 (batch_size,) 比如 (32,)
+    # h	图像 height	224(模型输入)/ 256(原始)
+    # w	图像 width	224 / 256
+    # c	图像 channel(RGB)	3
+    # s	state 维度	模型里统一 pad 到 32(LIBERO 原始 8 维)
+    # l	prompt token length	max_token_len,π0 是 48,π0-fast 更长
+    
     # Images, in [-1, 1] float32.
     images: dict[str, at.Float[ArrayT, "*b h w c"]] # 多路相机图像，值域 [-1, 1] float32
     # Image masks, with same keys as images.
@@ -97,31 +106,47 @@ class Observation(Generic[ArrayT]):
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None # 语言指令的 token id
     # Tokenized prompt mask.
-    tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None# 语言的 padding mask
+    tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None# token 的 padding mask,True 表示真 token,False 表示 padding
 
     # pi0-fast model specific fields.
 
     # Token auto-regressive mask (for FAST autoregressive model).
+    #自回归生成用的 mask,标哪些位置是被模型自回归生成的(区别于条件输入 token)
     token_ar_mask: at.Int[ArrayT, "*b l"] | None = None
     # Token loss mask (for FAST autoregressive model).
+    #loss 计算 mask,只在标 True 的 token 上算 cross-entropy(非 prompt 部分才算)
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
     @classmethod
+    # 工厂方法: 把 data transforms 产出的"扁平 dict"转成"结构化 Observation"
+    # 输入 data 是一个嵌套 dict (PyTree), 期望包含以下 key:
+    #   - "image"       : dict[相机名 -> 图像张量]        (必需)
+    #   - "image_mask"  : dict[相机名 -> (B,) bool 张量]   (必需)
+    #   - "state"       : (B, s) float 张量               (必需)
+    #   - "tokenized_prompt"      : (B, l) int 张量       (可选, 需和 mask 成对)
+    #   - "tokenized_prompt_mask" : (B, l) bool 张量      (可选, 需和 prompt 成对)
+    #   - "token_ar_mask" / "token_loss_mask"             (可选, π0-fast 才有)
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
-        # Ensure that tokenized_prompt and tokenized_prompt_mask are provided together.
+        # 前置检查: prompt 和 mask 必须**同时**存在或**同时**不存在, 否则 attention 就算不了
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
-        # If images are uint8, convert them to [-1, 1] float32.
+        # 图像 dtype 规范化: 数据管线上游可能给 uint8 [0,255] 的原图, 这里统一转 float32 [-1,1]
+        # (SigLIP/PaliGemma 预训练用的就是 [-1,1] 归一化, 必须对齐)
         for key in data["image"]:
             if data["image"][key].dtype == np.uint8:
+                # numpy 分支: (B, H, W, C) uint8 → float32, /255 映到 [0,1], *2-1 映到 [-1,1]
                 data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
             elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
+                # torch 分支: 额外做 permute(0,3,1,2) 把 (B,H,W,C) 换成 (B,C,H,W) PyTorch 卷积常用布局
                 data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+        # 把 dict key 重命名后, 构造结构化 dataclass
+        # 注意: dict 里用单数 "image"/"image_mask", Observation 字段用复数 "images"/"image_masks"
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
             state=data["state"],
+            # 可选字段用 .get(), 缺失时为 None
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
