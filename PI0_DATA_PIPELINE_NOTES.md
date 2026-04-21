@@ -507,3 +507,217 @@ flowchart LR
 ```
 python scripts/compute_norm_stats.py --config-name=<your_config>
 ```
+
+---
+
+## 6. 完整手绘图梳理（训练数据流）
+
+对应的手绘图（data 流动 [训练]）展开成文字版本，把**训练主循环**和**数据集构造 / transform 拼装**两条线合并理解。
+
+### 6.1 两条线的汇合点
+
+```
+左线（train_pytorch.py）                 右线（data_loader.py）
+──────────────────────────────          ──────────────────────────
+train_loop()                             create_data_loader()
+    ↓                                        ↓
+build_dataset(config)                    create_torch_data_loader()
+    ↓                                        ↓ 两个子步骤：
+_data.create_data_loader() ──── 返回 ─── create_torch_dataset()  加载 LeRobotDataset
+                                          ↓
+                                         transform_dataset()     绑定 transform 链
+                                          ↓
+                                   TransformedDataset
+                                          ↓
+                                   包装成 TorchDataLoader → DataLoaderImpl
+    ↓ 拿到 loader                    ↓
+for observation, actions in loader:  ← 开始触发右线的执行
+    ↓
+    (observation, actions) 搬 GPU
+    ↓
+loss = model.forward(obs, act)        [pi0_pytorch.py]
+    ├── _preprocess_observation()     图像归一到 [-1,1]、填充 mask
+    ├── embed_prefix / embed_suffix   prefix_embs（语言+state）、suffix_embs（action）
+    └── expert.forward()              Transformer 预测 Flow Matching 的 v_t
+    ↓
+loss.backward() + optimizer.step()
+```
+
+**关键**：`for observation, actions in loader` **触发一次**就完整跑一遍右线（__getitem__ → transform chain → collate → batch），每个 step 都重新跑一次（lazy execution）。
+
+### 6.2 Loader 嵌套 5 层：每层职责
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ DataLoaderImpl          ← 最外层，暴露给训练代码         │
+│   职责：保存 data_config、dict → (Observation, Actions)  │
+│   ↓ 包含                                                 │
+│   TorchDataLoader       ← openpi 自己的包装              │
+│     职责：JAX/PyTorch 框架适配、无限循环、sharding        │
+│     ↓ 包含                                               │
+│     torch.utils.data.DataLoader  ← PyTorch 原生          │
+│       职责：batch 生产线（sampler + collate_fn + worker） │
+│       ↓ 读取                                             │
+│       TransformedDataset  ← 数据集 + transform 链         │
+│         职责：__getitem__ 时触发 transform 链执行         │
+│         ↓ 读取                                           │
+│         LeRobotDataset  ← 最底层                         │
+│           职责：从磁盘读原始 parquet，delta_timestamps    │
+│                 把单帧 action 变成 action chunk           │
+└─────────────────────────────────────────────────────────┘
+```
+
+**设计原则**：每层单一职责，外层业务、内层通用，可单独替换。
+
+### 6.3 `transform_dataset()` 展开后的完整 transform 链（LIBERO 为例）
+
+源码写的是 4 行（`*` 展开 + 单独插入 Normalize）：
+
+```python
+return TransformedDataset(
+    dataset,
+    [
+        *data_config.repack_transforms.inputs,      # ← 键名重映射
+        *data_config.data_transforms.inputs,        # ← 机器人特定变换
+        _transforms.Normalize(norm_stats, ...),     # ← 单独插入（位置关键）
+        *data_config.model_transforms.inputs,       # ← 模型输入格式化
+    ],
+)
+```
+
+展开成**真实的 transform 序列**（LIBERO + extra_delta_transform=True 场景）：
+
+```python
+return TransformedDataset(
+    dataset,
+    [
+        RepackTransform({...}),                  # ← 来自 repack_transforms.inputs，键名重映射
+        libero_policy.LiberoInputs(...),         # ← 来自 data_transforms.inputs，格式转换
+        _transforms.DeltaActions(delta_mask),    # ← 可选：if extra_delta_transform
+        _transforms.Normalize(norm_stats, ...),  # ← 单独插入，归一化
+        _transforms.InjectDefaultPrompt(...),    # ← 来自 model_transforms.inputs
+        _transforms.ResizeImages(224, 224),      # ← 来自 model_transforms.inputs
+        _transforms.TokenizePrompt(...),         # ← 来自 model_transforms.inputs
+        _transforms.PadStatesAndActions(...),    # ← 来自 model_transforms.inputs
+    ],
+)
+```
+
+对应手绘图右线从上到下：
+```
+LeRobotDataset
+  ↓ 原数据
+RepackTransform（键名重映射，config.py）
+  ↓
+LiberoInputs（格式转换，libero_policy.py）
+  ↓
+[DeltaActions]（抗扰&Δ动作，if extra_delta；注：仓库里只有 Delta，没有 Disturbance）
+  ↓
+Normalize（transforms.py）
+  ↓
+model_transform：
+  - ResizeImage（224×224）
+  - PadState/Action（pad 到 32 维）
+  - TokenizePrompt（PaliGemma tokenize）
+  ↓
+批处理（__getitem__ 返回单样本 → collate_fn 堆成 batch）
+```
+
+### 6.4 "更新单帧的 act" 的准确位置
+
+手绘图写的是：`for batch in loader: __getitem__() 更新单帧的 act, actions[t] → [t:t+act_hor]`。
+
+准确的说，这步**不在 transform 链里**，而是在 `create_torch_dataset()` 构造 `LeRobotDataset` 时通过 `delta_timestamps` 参数实现的：
+
+```python
+dataset = lerobot_dataset.LeRobotDataset(
+    repo_id,
+    delta_timestamps={
+        "actions": [t / fps for t in range(action_horizon)],
+        # LIBERO: [0.0, 0.1, 0.2, ..., 0.9] — 覆盖未来 1 秒
+    },
+)
+```
+
+效果：`ds[i]["actions"]` 的 shape 从 `(7,)` 自动变成 `(action_horizon, 7)`，每次 `__getitem__(i)` 返回**从第 i 帧开始的未来 H 帧 action chunk**，作为监督信号。
+
+### 6.5 各数据集 Policy 对比（为什么每个数据集都需要自己的 Inputs 类）
+
+| 维度 | **LIBERO** | **ALOHA** | **DROID** |
+|------|-----------|----------|----------|
+| 机器人类型 | 仿真（Robosuite） | 真机双臂 | 真机单臂 |
+| DoF | 7 | 14 | 8 |
+| 相机数 | 2（+1 零补齐） | 4（全齐） | 2（+1 零补齐） |
+| 图像格式 | 需转 CHW→HWC | 需转 CHW→HWC | 需转 CHW→HWC |
+| State 构造 | 直接透传 | `_decode_aloha` 变换 | concat `joint_position` + `gripper_position` |
+| Joint 翻转 | ❌ | ✅ `_joint_flip_mask` | ❌ |
+| Gripper 变换 | ❌ | ✅ 线性→角度几何变换 | ❌ |
+| 按 model_type 分支 | 只影响右腕 mask | ❌ | ✅ 完全不同相机布局 |
+| 输出 action 维度 | 7 | 14 | 8 |
+| 实现复杂度 | ⭐ | ⭐⭐⭐ | ⭐⭐ |
+
+**共同点**：所有 `XxxInputs.__call__` 输出**同一种嵌套结构**：
+
+```python
+{
+    "state": ...,
+    "image": {"base_0_rgb": ..., "left_wrist_0_rgb": ..., "right_wrist_0_rgb": ...},
+    "image_mask": {"base_0_rgb": ..., "left_wrist_0_rgb": ..., "right_wrist_0_rgb": ...},
+    "actions": ...,    # 训练时才有
+    "prompt": ...,
+}
+```
+
+**设计本质**：每个 Policy 是该数据集的**适配器（Adapter）**——把五花八门的数据集字段统一成 π0 模型期望的规范输入，模型架构因此可以跨平台共享权重。
+
+### 6.6 构造 vs 执行（常见误解）
+
+`transform_dataset()` 返回的 list 里每个元素都是**已构造但未执行**的对象：
+
+```python
+Normalize(norm_stats, use_quantiles=...)
+#        └──────────────┬───────────────┘
+#       只调 __init__ + __post_init__（验证配置）
+#       没做任何归一化计算
+```
+
+真正执行在**训练循环**触发的链路：
+
+```
+for obs, act in loader:
+    ↓
+dataset[i]（每个 batch 32 次）
+    ↓
+TransformedDataset.__getitem__(i):
+    return self._transform(self._dataset[i])
+                │
+                ▼ CompositeTransform
+                │
+    for t in transforms:
+        data = t(data)   ← ★ 这里才真的执行每个 transform ★
+```
+
+**单次 for 迭代 ≈ 32 次 __getitem__ ≈ 32 × 7 ≈ 224 次 transform.__call__**。
+训练 30k steps 则 transform 总调用数约 **670 万次**，所以 `num_workers > 0` 并行很重要。
+
+### 6.7 一眼定位代码的对照表
+
+| 手绘图层 | 代码位置 |
+|---------|---------|
+| `train_loop()` | [train_pytorch.py](scripts/train_pytorch.py) 主训练循环 |
+| `build_dataset(config)` | `build_datasets()` → `_data.create_data_loader()` |
+| `_data.create_data_loader()` | [data_loader.py:282](src/openpi/training/data_loader.py#L282) |
+| `create_torch_data_loader()` | [data_loader.py:330](src/openpi/training/data_loader.py#L330) |
+| `create_torch_dataset()` + LeRobotDataset | [data_loader.py:130](src/openpi/training/data_loader.py#L130) |
+| `transform_dataset()` | [data_loader.py:231](src/openpi/training/data_loader.py#L231) |
+| RepackTransform（键名重映射） | [transforms.py:82](src/openpi/transforms.py#L82)，具体映射在 [config.py:310](src/openpi/training/config.py#L310) |
+| LiberoInputs（格式转换） | [libero_policy.py:43](src/openpi/policies/libero_policy.py#L43) |
+| DeltaActions（if extra_delta） | [transforms.py:211](src/openpi/transforms.py#L211)，开关在 [config.py:298](src/openpi/training/config.py#L298) |
+| Normalize | [transforms.py:121](src/openpi/transforms.py#L121) |
+| model_transforms | `ModelTransformFactory` [config.py:115](src/openpi/training/config.py#L115) |
+| `__getitem__()` 返回 action chunk | [data_loader.py:58](src/openpi/training/data_loader.py#L58) + LeRobotDataset 内部 `delta_timestamps` 逻辑 |
+| `model.forward()` + `_preprocess_observation` / `embed_suffix` / `expert.forward` | `PI0Pytorch` ([pi0_pytorch.py](src/openpi/models_pytorch/pi0_pytorch.py)) |
+
+### 6.8 一句话总结整图
+
+> **训练时 `for observation, actions in loader` 每次迭代触发一批样本（32 条）走完 5 层 loader 嵌套（DataLoaderImpl → TorchDataLoader → torch.DataLoader → TransformedDataset → LeRobotDataset），底层 LeRobotDataset 靠 `delta_timestamps` 返回 action chunk，TransformedDataset 按顺序跑一串 transform（RepackTransform → LiberoInputs → [DeltaActions] → Normalize → model_transforms），collate 成 batch 后搬 GPU 喂给 `PI0Pytorch.forward`，forward 内部三步（_preprocess_observation → embed_prefix/suffix → expert.forward）算出 Flow Matching 的速度场 v_t，回出 loss 反传更新参数。整个 pipeline 是 lazy 的 —— 构造时只搭架子不执行，每次 __getitem__ 才真正跑 transform 链。**

@@ -299,51 +299,50 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        # The repack transform is *only* applied to the data coming from the dataset,
-        # and *not* during inference. We can use it to make inputs from the dataset look
-        # as close as possible to those coming from the inference environment (e.g. match the keys).
-        # Below, we match the keys in the dataset (which we defined in the data conversion script) to
-        # the keys we use in our inference pipeline (defined in the inference script for libero).
-        # For your own dataset, first figure out what keys your environment passes to the policy server
-        # and then modify the mappings below so your dataset's keys get matched to those target keys.
-        # The repack transform simply remaps key names here.
+        # ==================== 1. repack_transforms（键名重映射） ====================
+        # 作用：把 LIBERO 数据集里的"扁平键名"改成"层级式键名"，
+        #       让训练数据的格式和推理时环境传来的数据格式一致。
+        #
+        # 注意字典方向：{新键名: 老键名}
+        #   - 键（左边）= RepackTransform 产出后的新键名（模型期望的）
+        #   - 值（右边）= 原始数据里的老键名
+        #
+        # 这一步只改键名，不动 value（张量数据原样搬过去）。
+        # repack 只在训练时做，推理时不做（因为推理数据已经是目标格式了）。
+        
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
                     {
-                        "observation/image": "image",
-                        "observation/wrist_image": "wrist_image",
-                        "observation/state": "state",
-                        "actions": "actions",
-                        "prompt": "prompt",
+                        "observation/image": "image",               # 主相机图像
+                        "observation/wrist_image": "wrist_image",   # 手腕相机图像
+                        "observation/state": "state",               # 机器人状态（关节角等）
+                        "actions": "actions",                       # 动作序列
+                        "prompt": "prompt",                         # 语言指令
                     }
                 )
             ]
         )
 
-        # The data transforms are applied to the data coming from the dataset *and* during inference.
-        # Below, we define the transforms for data going into the model (``inputs``) and the transforms
-        # for data coming out of the model (``outputs``) (the latter is only used during inference).
-        # We defined these transforms in `libero_policy.py`. You can check the detailed comments there for
-        # how to modify the transforms to match your dataset. Once you created your own transforms, you can
-        # replace the transforms below with your own.
+        # ==================== 2. data_transforms（机器人层变换） ====================
+        # 作用：LIBERO 平台特有的数据处理（坐标系、夹爪编码等）
+        # inputs：训练时的正向变换
+        # outputs：推理时的反向变换（模型输出 → 真实物理动作）
+        #
+        # 具体实现在 libero_policy.py 里，训练和推理都要用到这一层。
         data_transforms = _transforms.Group(
             inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
             outputs=[libero_policy.LiberoOutputs()],
         )
 
-        # One additional data transform: pi0 models are trained on delta actions (relative to the first
-        # state in each action chunk). IF your data has ``absolute`` actions (e.g. target joint angles)
-        # you can uncomment the following line to convert the actions to delta actions. The only exception
-        # is for the gripper actions which are always absolute.
-        # In the example below, we would apply the delta conversion to the first 6 actions (joints) and
-        # leave the 7th action (gripper) unchanged, i.e. absolute.
-        # In Libero, the raw actions in the dataset are already delta actions, so we *do not* need to
-        # apply a separate delta conversion (that's why it's commented out). Choose whether to apply this
-        # transform based on whether your dataset uses ``absolute`` or ``delta`` actions out of the box.
-
-        # LIBERO already represents actions as deltas, but we have some old Pi0 checkpoints that are trained with this
-        # extra delta transform.
+        # ---------- 可选：absolute → delta 动作转换 ----------
+        # π0 模型是在 delta 动作（相对于 chunk 第一步）上训练的。
+        # 如果你的数据是 absolute 动作（如目标关节角），就需要开这个转换。
+        # 夹爪动作例外：始终用 absolute（不转 delta）。
+        #
+        # delta_action_mask = [True]*6 + [False]：前 6 维转 delta，最后 1 维（夹爪）保持
+        # LIBERO 数据集的 action 本身已是 delta，所以默认不开启（extra_delta_transform=False）。
+        # 只有加载旧的 π0 checkpoint 时可能需要设 True 保持兼容。
         if self.extra_delta_transform:
             delta_action_mask = _transforms.make_bool_mask(6, -1)
             data_transforms = data_transforms.push(
@@ -351,11 +350,15 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
             )
 
-        # Model transforms include things like tokenizing the prompt and action targets
-        # You do not need to change anything here for your own dataset.
+        # ==================== 3. model_transforms（模型层变换） ====================
+        # 作用：模型输入格式化（resize 图像、tokenize prompt、pad state/action 到模型维度等）
+        # 这一层所有数据集通用，由 ModelTransformFactory 根据 model_type（pi0 / pi05 / pi0_fast）生成。
+        # 自定义数据集一般不需要改这里。
         model_transforms = ModelTransformFactory()(model_config)
 
-        # We return all data transforms for training and inference. No need to change anything here.
+        # ==================== 4. 组装最终的 DataConfig ====================
+        # create_base_config 提供基础字段（repo_id、norm_stats 等），
+        # 然后用 dataclasses.replace 把上面三个 Group 塞进去，得到完整的 DataConfig。
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,

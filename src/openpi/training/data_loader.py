@@ -52,11 +52,15 @@ class DataLoader(Protocol[T_co]):
 
 class TransformedDataset(Dataset[T_co]):
     def __init__(self, dataset: Dataset, transforms: Sequence[_transforms.DataTransformFn]):
-        self._dataset = dataset
-        self._transform = _transforms.compose(transforms)
+        self._dataset = dataset# ① 保存底层 dataset
+        self._transform = _transforms.compose(transforms)# ② 把一堆 transform 合并成一个函数
 
-    def __getitem__(self, index: SupportsIndex) -> T_co:
+    def __getitem__(self, index: SupportsIndex) -> T_co:# ③ ★ 每次取样本自动跑 transform ★
         return self._transform(self._dataset[index])
+       #                      └──────────┬──────┘
+        #                      ① 先从底层读原始样本
+        #      └─────┬──────────────────────────┘
+        #            ② 再跑 self._transform（就是绑定的 transform 链）
 
     def __len__(self) -> int:
         return len(self._dataset)
@@ -359,14 +363,14 @@ def create_torch_data_loader(
         seed: The seed to use for shuffling the data.
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    dataxset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Use TorchDataLoader for both frameworks
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size
     # For JAX, divide by process count
     sampler = None
     if framework == "pytorch":
-        if torch.distributed.is_initialized():
+        if torch.distributed.is_initialized():#如果ddp开启，要多卡训练
             sampler = torch.utils.data.distributed.DistributedSampler(
                 dataset,
                 num_replicas=torch.distributed.get_world_size(),
@@ -438,7 +442,17 @@ def create_rlds_data_loader(
 
 
 class TorchDataLoader:
-    """Torch data loader implementation."""
+    """
+    基于 PyTorch 的通用 DataLoader 封装。
+
+    作用：在 PyTorch 原生 torch.utils.data.DataLoader 外面再加一层，目的是：
+      1. 屏蔽 JAX / PyTorch 两种框架的差异（sharding / tensor 类型转换）
+      2. 把"按 epoch 迭代"改成"无限循环"（openpi 是 step-based 训练，不分 epoch）
+      3. 支持 num_batches 上限（调试 / 评估时限制只跑 N 个 batch）
+
+    注意：本类 **不执行 transform**。transform 已经在更早的
+    TransformedDataset 里 lazy 绑定好，每次 dataset[i] 时自动执行。
+    """
 
     def __init__(
         self,
@@ -453,74 +467,103 @@ class TorchDataLoader:
         seed: int = 0,
         framework: str = "jax",
     ):
-        """Create a PyTorch data loader.
-
-        Args:
-            dataset: The dataset to load.
-            local_batch_size: The local batch size for each process.
-            sharding: The sharding to use for the data loader.
-            shuffle: Whether to shuffle the data.
-            num_batches: If provided, determines the number of returned batches. If the
-                number is larger than the number of batches in the dataset, the data loader
-                will loop over the dataset. If not provided, will iterate over the dataset
-                indefinitely.
-            num_workers: The number of worker processes to use. If zero, the data loader will
-                execute in the main process.
-            seed: The seed to use for shuffling the data.
         """
+        Args:
+            dataset: 要加载的数据集（已经被 TransformedDataset 包过）
+            local_batch_size: 每个进程（每张卡）的 batch 大小（全局 batch_size / world_size）
+            sharding: JAX 分布式分片策略（PyTorch 路径下传 None）
+            shuffle: 是否打乱数据顺序（有 sampler 时这个参数会被忽略）
+            sampler: 自定义采样器（多卡时通常是 DistributedSampler）
+            num_batches: 最多返回多少个 batch；None = 无限循环
+            num_workers: DataLoader 的并行 worker 进程数（0 = 主进程串行）
+            seed: shuffle 的随机种子（保证可复现）
+            framework: "jax" 或 "pytorch"，决定输出 batch 的类型
+        """
+        # ---- 安全检查 ----
+        # openpi 的 data loading 目前不支持 JAX 多进程（多机）场景
         if jax.process_count() > 1:
             raise NotImplementedError("Data loading with multiple processes is not supported.")
 
+        # 数据集比 batch_size 还小就没法训练，提前报错比后面 StopIteration 好排查
         if len(dataset) < local_batch_size:
             raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
 
-        # Store sharding - None for PyTorch, JAX sharding for JAX
+        # ---- 配置 sharding（仅 JAX 路径使用）----
+        # PyTorch 路径：sharding = None，batch 直接转成 torch.Tensor
+        # JAX 路径：如果没传 sharding，默认创建"数据并行"sharding（沿 batch 维切分到所有设备）
         self._sharding = sharding
         if sharding is None and framework == "jax":
-            # Use data parallel sharding by default for JAX only.
+            # 默认数据并行：devices 排成 1D mesh，按 batch 维 "B" 切分
             self._sharding = jax.sharding.NamedSharding(
                 jax.sharding.Mesh(jax.devices(), ("B",)),
                 jax.sharding.PartitionSpec("B"),
             )
         self._num_batches = num_batches
 
+        # ---- worker 进程管理 ----
+        # 使用 "spawn" 启动方式避免 fork 带来的 CUDA/JAX 初始化问题
+        # （fork 会复制父进程的 GPU 上下文，导致子进程 CUDA 出错）
         mp_context = None
         if num_workers > 0:
             mp_context = multiprocessing.get_context("spawn")
 
+        # ---- 随机数生成器 ----
+        # 绑定 seed 的 Generator，保证 shuffle 的结果可复现
         generator = torch.Generator()
         generator.manual_seed(seed)
+
+        # ---- 构造 PyTorch 原生 DataLoader ----
+        # 这是真正的数据加载核心，负责：按 sampler 给索引 → 调 dataset[i]（触发 transform）
+        # → 多 worker 并行 → collate 成 batch
         self._data_loader = torch.utils.data.DataLoader(
-            typing.cast(torch.utils.data.Dataset, dataset),
+            typing.cast(torch.utils.data.Dataset, dataset),#把 dataset 当作 torch.utils.data.Dataset 类型来看待"。
             batch_size=local_batch_size,
-            shuffle=(sampler is None and shuffle),  # Don't shuffle if using sampler
+            # shuffle 和 sampler 互斥：如果传了 sampler（多卡 DistributedSampler），
+            # 就不能再让 DataLoader 自己 shuffle（否则每卡看到的顺序乱掉）
+            shuffle=(sampler is None and shuffle),
             sampler=sampler,
             num_workers=num_workers,
             multiprocessing_context=mp_context,
+            # worker 保持常驻，每 epoch 不重建（省去反复 fork 开销）
             persistent_workers=num_workers > 0,
+            # 自定义 collate：把多个样本堆成 numpy 数组（支持嵌套 PyTree 结构）
             collate_fn=_collate_fn,
+            # worker 初始化时调整 JAX 的 GPU 内存分配策略
             worker_init_fn=_worker_init_fn,
+            # 丢掉最后不满 batch_size 的零碎数据（保证每个 batch 样本数一致）
             drop_last=True,
             generator=generator,
         )
 
     @property
     def torch_loader(self) -> torch.utils.data.DataLoader:
+        """暴露内部的 PyTorch DataLoader，供需要访问底层对象的代码用（如 DistributedSampler.set_epoch）"""
         return self._data_loader
 
     def __iter__(self):
+        """
+        无限循环迭代 batch。
+
+        openpi 是 step-based 训练（按 num_train_steps 控制停止，不按 epoch），
+        所以每当 PyTorch DataLoader 遍历完一遍就重新创建 iterator 继续跑，
+        直到达到 num_batches 限制或训练脚本主动停止。
+        """
         num_items = 0
-        while True:
+        while True:  # 外层无限循环：一个 epoch 结束后立刻开始下一个 epoch
             data_iter = iter(self._data_loader)
-            while True:
+            while True:  # 内层循环：遍历当前 epoch 的所有 batch
+                # 达到 num_batches 上限就停止（仅 debug/评估时用）
                 if self._num_batches is not None and num_items >= self._num_batches:
                     return
                 try:
                     batch = next(data_iter)
                 except StopIteration:
-                    break  # We've exhausted the dataset. Create a new iterator and start over.
+                    # 当前 epoch 耗尽，跳出内层循环，外层会创建新 iterator 继续
+                    break
                 num_items += 1
-                # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
+                # ---- 按框架转换输出类型 ----
+                # JAX：用 sharding 把 batch 切分到各设备（多 GPU 数据并行）
+                # PyTorch：直接转成 torch.Tensor（由下游 DDP 处理多卡分发）
                 if self._sharding is not None:
                     yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
                 else:
@@ -595,5 +638,9 @@ class DataLoaderImpl(DataLoader):
         return self._data_config
 
     def __iter__(self):
-        for batch in self._data_loader:
+        for batch in self._data_loader: # ← 执行到这里，从底层拿一个 batch
+            # #         └────────────┘
+            #         底层 TorchDataLoader 内部再触发整条 transform 链
+            #         最终 batch 是个 dict:
+            #            {"image": ..., "state": ..., "actions": ..., ...}
             yield _model.Observation.from_dict(batch), batch["actions"]

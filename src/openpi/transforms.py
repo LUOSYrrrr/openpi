@@ -38,13 +38,14 @@ class DataTransformFn(Protocol):
 
 @dataclasses.dataclass(frozen=True)
 class Group:
+    # 输入和输出分开管理
     """A group of transforms."""
 
     # Transforms that are applied to the model input data.
-    inputs: Sequence[DataTransformFn] = ()
+    inputs: Sequence[DataTransformFn] = ()# 训练时/推理输入走的
 
     # Transforms that are applied to the model output data.
-    outputs: Sequence[DataTransformFn] = ()
+    outputs: Sequence[DataTransformFn] = ()# 推理输出走的（反向变换）
 
     def push(self, *, inputs: Sequence[DataTransformFn] = (), outputs: Sequence[DataTransformFn] = ()) -> "Group":
         """Append transforms to the group and return a new group.
@@ -61,23 +62,27 @@ class Group:
 
 @dataclasses.dataclass(frozen=True)
 class CompositeTransform(DataTransformFn):
+  #按顺序执行多个 transform
     """A composite transform that applies a sequence of transforms in order."""
 
     transforms: Sequence[DataTransformFn]
 
     def __call__(self, data: DataDict) -> DataDict:
-        for transform in self.transforms:
+        for transform in self.transforms: # ← 依次跑每个 transform
             data = transform(data)
         return data
 
 
 def compose(transforms: Sequence[DataTransformFn]) -> DataTransformFn:
+  #工厂函数
     """Compose a sequence of transforms into a single transform."""
     return CompositeTransform(transforms)
 
 
 @dataclasses.dataclass(frozen=True)
+#字段重排 / 格式转换
 class RepackTransform(DataTransformFn):
+  #键名重映射：把数据集特定字段重命名成标准字段（如 obs/image → images/base_0_rgb）
     """Repacks an input dictionary into a new dictionary.
 
     Repacking is defined using a dictionary where the keys are the new keys and the values
@@ -102,7 +107,9 @@ class RepackTransform(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+#B. 语言处理
 class InjectDefaultPrompt(DataTransformFn):
+  #没有 prompt 时注入默认的（如 "perform task"）
     prompt: str | None
 
     def __call__(self, data: DataDict) -> DataDict:
@@ -245,7 +252,9 @@ class AbsoluteActions(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+# B. 语言处理
 class TokenizePrompt(DataTransformFn):
+  #把文本 prompt 用 PaliGemma tokenizer 转成 token ID
     tokenizer: _tokenizer.PaligemmaTokenizer
     discrete_state_input: bool = False
 
@@ -308,6 +317,7 @@ class ExtractFASTActions(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class PromptFromLeRobotTask(DataTransformFn):
+  #	把 LeRobot 的 task_index（整数）查表转成自然语言 prompt
     """Extracts a prompt from the current LeRobot dataset task."""
 
     # Contains the LeRobot dataset tasks (dataset.meta.tasks).

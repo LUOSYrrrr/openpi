@@ -377,7 +377,7 @@ def train_loop(config: _config.TrainConfig):
     # build_datasets 里会跑完整条 transform pipeline（RepackTransform→LiberoInputs→Normalize→Tokenize→Pad）
     loader, data_config = build_datasets(config)
 
-    # Log sample images to wandb on first batch
+
     # 首个 batch 抽 5 张图上传 wandb，直观核对数据是否正常（是否旋转、resize、归一化对）
     if is_main and config.wandb_enabled and not resuming:
         # Create a separate data loader for sample batch to avoid consuming the main loader
