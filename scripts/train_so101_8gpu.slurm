@@ -1,22 +1,24 @@
 #!/bin/bash
-# Train pi05_so101 on 8× A100 80G — matches the original π0.5 fine-tuning recipe (batch=256).
-# Estimated wall time: 5-7h for 30k steps.
+# Train pi05_so101 on 8× A100 80G across 2 NODES × 4 GPUs.
+# Spartan FEIT A100 nodes are 4-GPU each, so single-node 8 GPU is impossible
+# (you'd get "Requested node configuration is not available").
 #
-# WARNING: Spartan A100 nodes typically have 4 GPUs each. If `--gres=gpu:8` on
-# 1 node fails to schedule, switch to multi-node:
-#   #SBATCH --nodes=2 --ntasks-per-node=1 --gres=gpu:4
-# (Multi-node JAX needs extra setup; ask if you hit this.)
+# Multi-node JAX init is handled by scripts/train.py via _maybe_init_jax_distributed():
+# it reads SLURM_NTASKS / SLURM_PROCID / SLURM_JOB_NODELIST and calls
+# jax.distributed.initialize() before main(). Launch with srun (one task per node).
+#
+# Estimated wall time: 5-7h for 30k steps at batch=256 (full π0.5 recipe).
 
 #SBATCH --job-name=pi05_so101_8g
 #SBATCH --account=punim2341
 #SBATCH --partition=feit-gpu-a100
 #SBATCH --qos=feit
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=64
-#SBATCH --gres=gpu:8
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=32
+#SBATCH --gres=gpu:4
 #SBATCH --time=0-10:00:00
-#SBATCH --mem=480G
+#SBATCH --mem=240G
 #SBATCH -o slurm-%j.out
 #SBATCH -e slurm-%j.err
 #SBATCH --mail-user=siyuan.luo.1@student.unimelb.edu.au
@@ -45,11 +47,15 @@ if [ ! -f "$NORM_FILE" ]; then
   uv run scripts/compute_norm_stats.py --config-name pi05_so101
 fi
 
-echo "==> Training pi05_so101 (8 GPUs, batch=256 — full π0.5 recipe)..."
-uv run scripts/train.py pi05_so101 \
+# IMPORTANT: launch with srun so SLURM spawns one process per node.
+# Each process will then call jax.distributed.initialize() (via train.py's
+# _maybe_init_jax_distributed helper) and JAX will discover all 8 GPUs.
+echo "==> Training pi05_so101 (2 nodes × 4 GPUs, batch=256 — full π0.5 recipe)..."
+srun uv run scripts/train.py pi05_so101 \
   --exp-name="$EXP_NAME" \
   --checkpoint-base-dir="$CKPT_BASE"
 
+# HF upload runs once on the launching shell (not srun) so we don't double-upload.
 CKPT_DIR="$CKPT_BASE/pi05_so101/$EXP_NAME/30000"
 if [ -d "$CKPT_DIR" ]; then
   echo "==> Uploading ckpt to HF Hub..."
