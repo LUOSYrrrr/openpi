@@ -19,6 +19,7 @@ set -euo pipefail
 module load Anaconda3/2024.02-1
 module load GCCcore/13.3.0
 module load FFmpeg/7.0.2
+eval "$(conda shell.bash hook)"   # init conda for non-interactive shell
 conda activate openpi
 
 export HF_LEROBOT_HOME=/data/gpfs/projects/punim2341/siyuanluo/lerobot_cache
