@@ -27,7 +27,7 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
 REPO_DIR=/data/gpfs/projects/punim2341/siyuanluo/openpi/openpi
 CKPT_BASE=/data/gpfs/projects/punim2341/siyuanluo/checkpoints
 EXP_NAME=so101_yellow_tape_v1_2g
-NORM_FILE=$REPO_DIR/assets/pi05_so101/LUOSYrrrrr/so101_yellow_tape_v1/norm_stats.json
+NORM_FILE=$REPO_DIR/assets/pi05_so101/LUOSYrrrrr/so101_yellow_tape_v1_v21/norm_stats.json
 
 cd $REPO_DIR
 git pull --ff-only

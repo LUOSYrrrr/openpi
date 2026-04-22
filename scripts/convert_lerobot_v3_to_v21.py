@@ -87,19 +87,60 @@ def load_v3_info(src_root: Path) -> dict:
 
 def load_v3_episodes_df(src_root: Path) -> pd.DataFrame:
     """The v3 episodes parquet tells us which file each episode lives in,
-    its frame range, and (optionally) per-episode stats columns."""
+    its frame range, and (optionally) per-episode stats columns.
+
+    v3 sometimes SPLITS this into multiple parquets (one with metadata,
+    another with stats). We merge by episode_index instead of stacking rows.
+    """
     ep_files = sorted((src_root / "meta" / "episodes").glob("chunk-*/file*.parquet"))
     if not ep_files:
         raise FileNotFoundError(f"No episodes parquet under {src_root / 'meta' / 'episodes'}")
-    return pd.concat([pd.read_parquet(p) for p in ep_files], ignore_index=True)
+
+    dfs = [pd.read_parquet(p) for p in ep_files]
+    # Print schema for diagnostics.
+    for p, df in zip(ep_files, dfs):
+        print(f"   {p.name}: {len(df)} rows, {len(df.columns)} cols")
+
+    # Detect whether files are SHARDED (same columns, different episodes) or
+    # SPLIT by content (same episodes, different columns). We check whether
+    # the first column set fully matches the second.
+    if len(dfs) == 1:
+        return dfs[0]
+
+    same_cols = all(set(d.columns) == set(dfs[0].columns) for d in dfs[1:])
+    if same_cols:
+        return pd.concat(dfs, ignore_index=True).sort_values("episode_index").reset_index(drop=True)
+
+    # Otherwise: merge on episode_index (outer join) so we get all columns.
+    if not all("episode_index" in d.columns for d in dfs):
+        raise ValueError(
+            "Episode parquets have different column sets but at least one is missing "
+            "'episode_index' so they can't be joined."
+        )
+    merged = dfs[0]
+    for d in dfs[1:]:
+        merged = merged.merge(d, on="episode_index", how="outer", suffixes=("", "_dup"))
+        # Drop suffixed duplicates (right-side wins is fine since values match).
+        dup_cols = [c for c in merged.columns if c.endswith("_dup")]
+        merged = merged.drop(columns=dup_cols)
+    return merged.sort_values("episode_index").reset_index(drop=True)
 
 
 def load_v3_tasks(src_root: Path) -> pd.DataFrame:
-    """v3 tasks.parquet has columns: task_index, task."""
+    """Return a DataFrame with explicit `task` + `task_index` columns.
+
+    v3 stores tasks in two possible shapes:
+      - tasks.parquet indexed by task string with a `task_index` column
+      - tasks.jsonl with `{task_index, task}` rows
+    Normalize both to flat columns so downstream code is uniform.
+    """
     tasks_path = src_root / "meta" / "tasks.parquet"
     if tasks_path.exists():
-        return pd.read_parquet(tasks_path)
-    # Some v3 datasets may still write tasks.jsonl — fall back.
+        df = pd.read_parquet(tasks_path)
+        if "task" not in df.columns:
+            # The task string is in the index. Promote to a column.
+            df = df.reset_index().rename(columns={df.index.name or "index": "task"})
+        return df
     tasks_jsonl = src_root / "meta" / "tasks.jsonl"
     if tasks_jsonl.exists():
         rows = [json.loads(l) for l in tasks_jsonl.read_text().splitlines() if l.strip()]
@@ -109,12 +150,37 @@ def load_v3_tasks(src_root: Path) -> pd.DataFrame:
 
 def load_v3_episode_data(src_root: Path, info: dict, episode_row: pd.Series) -> pd.DataFrame:
     """Open the v3 parquet that contains this episode and slice its rows."""
-    chunk = int(episode_row["data_chunk_index"])
-    file_idx = int(episode_row["data_file_index"])
+    chunk = int(episode_row["data/chunk_index"])
+    file_idx = int(episode_row["data/file_index"])
     rel = info["data_path"].format(chunk_index=chunk, file_index=file_idx)
     df = pd.read_parquet(src_root / rel)
     ep_idx = int(episode_row["episode_index"])
     return df[df["episode_index"] == ep_idx].reset_index(drop=True)
+
+
+def extract_episode_stats_from_row(episode_row: pd.Series, info: dict) -> dict:
+    """Pull per-episode stats directly from the v3 episodes parquet columns
+    (stored as `stats/<feat>/{min,max,mean,std,count,q01,...}`)."""
+    stats: dict[str, dict] = {}
+    for feat_name, feat_meta in info["features"].items():
+        if feat_meta.get("dtype") == "video":
+            continue
+        prefix = f"stats/{feat_name}/"
+        feat_cols = [c for c in episode_row.index if c.startswith(prefix)]
+        if not feat_cols:
+            continue
+        s: dict[str, list] = {}
+        for c in feat_cols:
+            stat_name = c[len(prefix):]
+            val = episode_row[c]
+            if isinstance(val, np.ndarray):
+                s[stat_name] = val.tolist()
+            elif isinstance(val, list):
+                s[stat_name] = val
+            else:
+                s[stat_name] = [float(val)]
+        stats[feat_name] = s
+    return stats
 
 
 def ffmpeg_extract_episode_video(
@@ -255,7 +321,6 @@ def convert(
     episodes_df = episodes_df.sort_values("episode_index").reset_index(drop=True)
 
     video_keys = [k for k, v in info["features"].items() if v.get("dtype") == "video"]
-    fps = info["fps"]
 
     episodes_jsonl: list[dict] = []
     episodes_stats_jsonl: list[dict] = []
@@ -270,17 +335,14 @@ def convert(
         ep_df.to_parquet(parquet_path)
 
         # ---- 2. Per-episode video clips --------------------------------- #
-        # Frame range -> seconds. v3 timestamps are absolute within concat file.
-        if "from_timestamp" in ep and "to_timestamp" in ep:
-            t0, t1 = float(ep["from_timestamp"]), float(ep["to_timestamp"])
-        else:
-            # Fallback: use first/last timestamp from the episode rows.
-            t0 = float(ep_df["timestamp"].iloc[0])
-            t1 = float(ep_df["timestamp"].iloc[-1]) + 1.0 / fps
-
+        # v3 stores per-camera chunk/file/from_timestamp/to_timestamp because
+        # different cameras may end up in different concat files when sized
+        # independently.
         for vk in video_keys:
-            v_chunk = int(ep["video_chunk_index"])
-            v_file = int(ep["video_file_index"])
+            v_chunk = int(ep[f"videos/{vk}/chunk_index"])
+            v_file = int(ep[f"videos/{vk}/file_index"])
+            t0 = float(ep[f"videos/{vk}/from_timestamp"])
+            t1 = float(ep[f"videos/{vk}/to_timestamp"])
             src_video_rel = info["video_path"].format(
                 video_key=vk, chunk_index=v_chunk, file_index=v_file
             )
@@ -306,10 +368,13 @@ def convert(
             "length": int(ep["length"]),
         })
 
-        episodes_stats_jsonl.append({
-            "episode_index": ep_idx,
-            "stats": compute_episode_stats(ep_df, info),
-        })
+        # Pull pre-computed per-episode stats out of the v3 episodes parquet
+        # (columns like `stats/action/min`, `stats/action/q01`, etc.). Falls
+        # back to recomputing from the raw frames if not present.
+        ep_stats = extract_episode_stats_from_row(ep, info)
+        if not ep_stats:
+            ep_stats = compute_episode_stats(ep_df, info)
+        episodes_stats_jsonl.append({"episode_index": ep_idx, "stats": ep_stats})
 
     # ---- 4. v2.1 meta files --------------------------------------------- #
     write_v21_info(out_dir, info, n_episodes)
