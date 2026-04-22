@@ -24,6 +24,8 @@
 
 set -euo pipefail
 module load Anaconda3/2024.02-1
+module load GCCcore/13.3.0 # required by FFmpeg/7.0.2 (Lmod hierarchical)
+module load FFmpeg/7.0.2   # torchcodec needs libavutil/libavcodec/etc.
 conda activate openpi
 
 export HF_LEROBOT_HOME=/data/gpfs/projects/punim2341/siyuanluo/lerobot_cache
