@@ -844,7 +844,7 @@ _CONFIGS = [
         name="pi05_so101",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
         data=LeRobotSO101DataConfig(
-            repo_id="LUOSYrrrrr/so101_yellow_tape_v1",
+            repo_id="LUOSYrrrrr/so101_yellow_tape_v1_v21",
             base_config=DataConfig(prompt_from_task=True),
         ),
         batch_size=256,
