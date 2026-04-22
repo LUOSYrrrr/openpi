@@ -39,7 +39,7 @@ git pull --ff-only
 
 if [ ! -f "$NORM_FILE" ]; then
   echo "==> Computing norm stats..."
-  uv run scripts/compute_norm_stats.py pi05_so101
+  uv run scripts/compute_norm_stats.py --config-name pi05_so101
 fi
 
 echo "==> Training pi05_so101 (8 GPUs, batch=256 — full π0.5 recipe)..."
