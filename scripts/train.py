@@ -1,7 +1,9 @@
 import dataclasses
 import functools
 import logging
+import os
 import platform
+import subprocess
 from typing import Any
 
 import etils.epath as epath
@@ -276,5 +278,23 @@ def main(config: _config.TrainConfig):
     checkpoint_manager.wait_until_finished()
 
 
+def _maybe_init_jax_distributed() -> None:
+    """If launched under SLURM with multiple tasks, initialize jax.distributed
+    so JAX can pool GPUs across nodes. No-op for single-node jobs."""
+    n_tasks = int(os.environ.get("SLURM_NTASKS", "1"))
+    if n_tasks <= 1:
+        return
+    nodelist = os.environ["SLURM_JOB_NODELIST"]
+    coord_node = subprocess.check_output(
+        ["scontrol", "show", "hostnames", nodelist]
+    ).decode().splitlines()[0]
+    jax.distributed.initialize(
+        coordinator_address=f"{coord_node}:12345",
+        num_processes=n_tasks,
+        process_id=int(os.environ["SLURM_PROCID"]),
+    )
+
+
 if __name__ == "__main__":
+    _maybe_init_jax_distributed()
     main(_config.cli())
