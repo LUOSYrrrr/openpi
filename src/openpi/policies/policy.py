@@ -67,8 +67,12 @@ class Policy(BasePolicy):
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
+        #  # 1. 深拷贝 obs（防止 transforms 原地改 client 的数据）
         inputs = jax.tree.map(lambda x: x, obs)
+        # # 2. 跑输入 transforms 链
         inputs = self._input_transform(inputs)
+        
+        #  # 3. 加 batch 维 + 转成 tensor（JAX or PyTorch）
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
@@ -79,6 +83,7 @@ class Policy(BasePolicy):
             sample_rng_or_pytorch_device = self._pytorch_device
 
         # Prepare kwargs for sample_actions
+        ## 4. 可选噪声（给 diffusion 模型用，一般 None）
         sample_kwargs = dict(self._sample_kwargs)
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
@@ -87,19 +92,24 @@ class Policy(BasePolicy):
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
 
+        ## 5. 把 dict 装进结构化 Observation
         observation = _model.Observation.from_dict(inputs)
+        ## 6. 真正调模型采样 → 拿到 actions
         start_time = time.monotonic()
         outputs = {
             "state": inputs["state"],
             "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
         }
         model_time = time.monotonic() - start_time
+        ## 7. 去 batch 维 + 转回 numpy（给 msgpack 序列化用）
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
+        # # 8. 跑输出 transforms 链（反归一化等）
         outputs = self._output_transform(outputs)
+        ## 9. 加计时信息返回
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }

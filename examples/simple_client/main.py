@@ -115,6 +115,7 @@ class TimingRecorder:
 
 
 def main(args: Args) -> None:
+  # # 1. 根据 env 选假 obs 生成器
     obs_fn = {
         EnvMode.ALOHA: _random_observation_aloha,
         EnvMode.ALOHA_SIM: _random_observation_aloha,
@@ -122,6 +123,7 @@ def main(args: Args) -> None:
         EnvMode.LIBERO: _random_observation_libero,
     }[args.env]
 
+    # # 2. 连 server
     policy = _websocket_client_policy.WebsocketClientPolicy(
         host=args.host,
         port=args.port,
@@ -130,14 +132,16 @@ def main(args: Args) -> None:
     logger.info(f"Server metadata: {policy.get_server_metadata()}")
 
     # Send a few observations to make sure the model is loaded.
+    # # 3. Warmup: 先空跑 2 次让 server 把 JAX JIT 编译完
     for _ in range(2):
         policy.infer(obs_fn())
 
+    ## 4. 主循环: 测 num_steps 次延迟
     timing_recorder = TimingRecorder()
 
     for _ in tqdm.trange(args.num_steps, desc="Running policy"):
         inference_start = time.time()
-        action = policy.infer(obs_fn())
+        action = policy.infer(obs_fn())# # ← 发请求
         timing_recorder.record("client_infer_ms", 1000 * (time.time() - inference_start))
         for key, value in action.get("server_timing", {}).items():
             timing_recorder.record(f"server_{key}", value)

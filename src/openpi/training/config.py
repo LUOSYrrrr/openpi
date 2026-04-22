@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.so101_policy as so101_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -364,6 +365,46 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotSO101DataConfig(DataConfigFactory):
+    """SO-101 single-arm + 2 cameras (top, wrist), 6-DoF + gripper, fps=30."""
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # LeRobot v3 raw keys → standard internal keys consumed by SO101Inputs.
+        # Note: the LeRobot raw action key is "action" (singular); we rename it to
+        # "actions" (plural) for downstream transforms / chunking.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image.top": "observation.images.top",
+                        "observation/image.wrist": "observation.images.wrist",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[so101_policy.SO101Inputs(model_type=model_config.model_type)],
+            outputs=[so101_policy.SO101Outputs()],
+        )
+
+        # π0.5 was trained on absolute actions for LeRobot data — no delta transform.
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
         )
 
 
@@ -794,6 +835,28 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    # Fine-tune π0.5 on a real SO-101 LeRobot dataset (single arm, 2 cameras).
+    # Matches the original π0.5 fine-tuning recipe (batch=256, 30k steps).
+    # Requires multi-GPU: typically 8×A100 80G or 4×H100 80G to fit batch=256.
+    TrainConfig(
+        name="pi05_so101",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotSO101DataConfig(
+            repo_id="LUOSYrrrrr/so101_yellow_tape_v1",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
     ),
     #

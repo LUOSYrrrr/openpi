@@ -721,3 +721,114 @@ TransformedDataset.__getitem__(i):
 ### 6.8 一句话总结整图
 
 > **训练时 `for observation, actions in loader` 每次迭代触发一批样本（32 条）走完 5 层 loader 嵌套（DataLoaderImpl → TorchDataLoader → torch.DataLoader → TransformedDataset → LeRobotDataset），底层 LeRobotDataset 靠 `delta_timestamps` 返回 action chunk，TransformedDataset 按顺序跑一串 transform（RepackTransform → LiberoInputs → [DeltaActions] → Normalize → model_transforms），collate 成 batch 后搬 GPU 喂给 `PI0Pytorch.forward`，forward 内部三步（_preprocess_observation → embed_prefix/suffix → expert.forward）算出 Flow Matching 的速度场 v_t，回出 loss 反传更新参数。整个 pipeline 是 lazy 的 —— 构造时只搭架子不执行，每次 __getitem__ 才真正跑 transform 链。**
+
+---
+
+## 7. 自己的理解总结（Task 3 + Task 4 过完后）
+
+### 7.1 训练数据 pipeline — 三个关键词
+
+1. **Lazy load**：`TransformedDataset.__getitem__(i)` 才真正触发 transforms，不预计算。
+   - 构造时只搭架子：`Normalize(...)`, `LiberoInputs(...)` 这些对象全部"已构造但未执行"。
+   - 训练循环里 `for batch in loader` 每次迭代才通过多 worker 并发调 `__getitem__` → 跑完整条 transform 链 → collate 成 batch。
+   - 代码锚点：[data_loader.py:53-66](src/openpi/training/data_loader.py#L53-L66) 的 `TransformedDataset` 实现。
+
+2. **4 层洋葱 transforms（按顺序）**：
+
+   ```text
+   RepackTransform        (键名重映射)
+   LiberoInputs           (格式转换、打包图像/state/prompt)
+   [DeltaActions]         (可选，仅 pi0 开启 extra_delta_transform 时)
+   Normalize              (按 norm_stats.json 归一化 state + action)
+   model_transforms       (InjectDefaultPrompt → ResizeImage → TokenizePrompt → PadStatesAndActions)
+   ```
+
+3. **训练只用 `.inputs`，不用 `.outputs`**：
+   - action label 和 state 一起被 Normalize，**loss 直接在归一化空间算** → 没必要反归一化。
+   - 所以训练链是单向的，没有 output transforms。
+
+### 7.2 推理（C/S）数据流 — 训练的"镜像对称"
+
+运行命令：
+
+```bash
+# Terminal 1: 起 server
+uv run scripts/serve_policy.py policy:checkpoint \
+    --policy.config=pi05_libero \
+    --policy.dir=gs://openpi-assets/checkpoints/pi05_libero
+
+# Terminal 2: 起 client（压测工具，用随机 obs）
+uv run examples/simple_client/main.py --env LIBERO
+```
+
+核心链路（server 侧）：
+
+```text
+serve_policy.main
+    ↓
+create_policy(args) → create_trained_policy(...)       [policy_config.py:16-94]
+    ↓   组装 Policy：model + 双向 transforms + norm_stats
+WebsocketPolicyServer(policy=...).serve_forever()      [serve_policy.py:111-117]
+    ↓
+_handler 每收到 client 一条 msgpack msg:               [websocket_policy_server.py:48-83]
+    obs_dict = unpack(ws.recv())
+    action = self._policy.infer(obs_dict)              ← 核心单步推理
+    ws.send(pack(action))
+```
+
+`Policy.infer()` 的 8 步（[policy.py:68-106](src/openpi/policies/policy.py#L68-L106)）：
+
+1. 拷贝 obs（防 transforms 原地改）
+2. `self._input_transform(inputs)` — 跑完整输入 transforms 链（和训练一样的 4 层）
+3. 加 batch 维：`x[np.newaxis, ...]`，**推理永远 batch=1**（一个 client 一次问一个动作）
+4. （可选 noise）
+5. `Observation.from_dict(inputs)` — dict → 结构化 dataclass
+6. `self._sample_actions(...)` — 真正调模型（扩散 10 步去噪）
+7. 去 batch 维 + 转回 numpy
+8. `self._output_transform(outputs)` — 输出链（model_transforms.outputs → Unnormalize → data_transforms.outputs → repack.outputs）
+
+### 7.3 训练 vs 推理 — 一张对照表
+
+| 阶段 | input transforms | output transforms | batch size | 为什么 |
+| --- | --- | --- | --- | --- |
+| **训练** | ✅ 用（处理 obs + action target） | ❌ 不用 | 256 | loss 在归一化空间算 |
+| **推理** | ✅ 用（只有 obs） | ✅ 用（反归一化 action 回真实单位） | **1** | robot 只认真实单位；单 client 单请求 |
+
+关键不变量：**同一套 transforms 代码**（`policy_config.py` 和 `data_loader.py` 里组装顺序完全一致）+ **同一份 norm_stats.json**（从 checkpoint 的 `assets/` 目录读）→ 保证训练分布 = 推理分布。
+
+### 7.4 延迟分析（本机 RTX GPU，pi05_libero，LIBERO env）
+
+```text
+client_infer_ms       121.8 ms    ← 客户端视角总延迟
+server_infer_ms       120.4 ms    ← server 端处理（含 transforms + model + 打包）
+policy_infer_ms        95.9 ms    ← 纯 model.sample_actions（扩散 10 步）
+server_prev_total_ms  122.2 ms    ← 上次请求 server 端端到端时长
+```
+
+拆分：
+
+| 项目 | 计算 | 值 | 占比 |
+| --- | --- | --- | --- |
+| 网络 + msgpack | `client - server` | 1.4 ms | 1% |
+| Server CPU（transforms + 打包） | `server - policy` | 24.5 ms | 20% |
+| 模型 forward（GPU） | `policy` | 95.9 ms | 79% |
+
+结论：瓶颈在**模型本身**，优化空间 = 减少 diffusion 步数 / 更小模型 / 量化 / 更好 GPU。
+
+### 7.5 一个理解关键点：为什么要有 `Policy` 这一层
+
+model（`_model.BaseModel`）只会做**纯神经网络前向**：吃 `Observation` 结构体、吐 tensor，不认识"client 传来的 raw dict""prompt 字符串""PNG 图像 bytes"。
+
+`Policy` 类的作用就是**模型面向用户的包装**：
+
+- 内部存 `model + input_transform + output_transform + norm_stats`
+- 对外暴露 `infer(obs_dict) → action_dict`
+- 把所有"原始 dict ↔ 模型能吃的 tensor"的转换都封在里面
+
+所以 `WebsocketPolicyServer` 只要 `policy.infer(obs)` 一行就搞定，完全不用关心模型细节——**这是典型的关注点分离**。
+
+### 7.6 Task 3/4 共同体会
+
+- **架构的优雅**：openpi 通过把 transforms 抽象成 `DataTransformFn` Protocol + `Group(inputs, outputs)` 容器，让训练和推理共享同一份 transforms 代码。模型开发和数据处理解耦彻底。
+- **lazy + 镜像对称**是整个数据流的核心设计哲学：训练 lazy 吐 batch，推理镜像走回来。
+- **`norm_stats.json` 是粘合剂**：训练时算、checkpoint 里存、推理时读，保证两端同分布。一个几 KB 的 JSON 文件串起了整个生命周期。

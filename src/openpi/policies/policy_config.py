@@ -43,7 +43,7 @@ def create_trained_policy(
         presence of "model.safensors" in the checkpoint directory.
     """
     repack_transforms = repack_transforms or transforms.Group()
-    checkpoint_dir = download.maybe_download(str(checkpoint_dir))
+    checkpoint_dir = download.maybe_download(str(checkpoint_dir))#如果没下载过下载checkpoint
 
     # Check if this is a PyTorch model by looking for model.safetensors
     weight_path = os.path.join(checkpoint_dir, "model.safetensors")
@@ -51,20 +51,22 @@ def create_trained_policy(
 
     logging.info("Loading model...")
     if is_pytorch:
-        model = train_config.model.load_pytorch(train_config, weight_path)
+        model = train_config.model.load_pytorch(train_config, weight_path)#加载模型权重
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     else:
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
-    data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+    data_config = train_config.data.create(train_config.assets_dirs, train_config.model)#建data config
     if norm_stats is None:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
         # that the policy is using the same normalization stats as the original training process.
         if data_config.asset_id is None:
             raise ValueError("Asset id is required to load norm stats.")
+        #从 checkpoint 里的 assets/ 读归一化统计量（均值/方差/分位数），必须和训练时一致
         norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
 
     # Determine the device to use for PyTorch models
     if is_pytorch and pytorch_device is None:
+        #有 CUDA 就 "cuda"，没有就 "cpu"     
         try:
             import torch
 
