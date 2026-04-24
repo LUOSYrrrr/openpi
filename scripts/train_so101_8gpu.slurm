@@ -53,7 +53,8 @@ fi
 echo "==> Training pi05_so101 (2 nodes × 4 GPUs, batch=256 — full π0.5 recipe)..."
 srun uv run scripts/train.py pi05_so101 \
   --exp-name="$EXP_NAME" \
-  --checkpoint-base-dir="$CKPT_BASE"
+  --checkpoint-base-dir="$CKPT_BASE" \
+  --overwrite
 
 # HF upload runs once on the launching shell (not srun) so we don't double-upload.
 CKPT_DIR="$CKPT_BASE/pi05_so101/$EXP_NAME/30000"
