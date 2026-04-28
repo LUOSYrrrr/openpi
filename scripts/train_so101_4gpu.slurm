@@ -44,7 +44,8 @@ echo "==> Training pi05_so101 (4 GPUs, batch=128)..."
 uv run scripts/train.py pi05_so101 \
   --batch-size=128 \
   --exp-name="$EXP_NAME" \
-  --checkpoint-base-dir="$CKPT_BASE"
+  --checkpoint-base-dir="$CKPT_BASE" \
+  --overwrite
 
 CKPT_DIR="$CKPT_BASE/pi05_so101/$EXP_NAME/30000"
 if [ -d "$CKPT_DIR" ]; then
