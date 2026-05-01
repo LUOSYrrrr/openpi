@@ -31,8 +31,21 @@ module load FFmpeg/7.0.2   # torchcodec needs libavutil/libavcodec/etc.
 eval "$(conda shell.bash hook)"   # init conda for non-interactive shell
 conda activate openpi
 
+# === Secrets (WANDB_API_KEY, HF_TOKEN) ===
+# Create ~/.openpi_env on Spartan with:
+#   export WANDB_API_KEY="..."
+#   export HF_TOKEN="..."
+if [ -f ~/.openpi_env ]; then
+  source ~/.openpi_env
+else
+  echo "WARNING: ~/.openpi_env not found - wandb/HF upload may fail" >&2
+fi
+
 export HF_LEROBOT_HOME=/data/gpfs/projects/punim2341/siyuanluo/lerobot_cache
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
+export JAX_COMPILATION_CACHE_DIR=/data/gpfs/projects/punim2341/siyuanluo/jax_cache
+export WANDB_DIR=/data/gpfs/projects/punim2341/siyuanluo/wandb
+mkdir -p "$JAX_COMPILATION_CACHE_DIR" "$WANDB_DIR"
 
 REPO_DIR=/data/gpfs/projects/punim2341/siyuanluo/openpi/openpi
 CKPT_BASE=/data/gpfs/projects/punim2341/siyuanluo/checkpoints

@@ -22,6 +22,11 @@ module load FFmpeg/7.0.2
 eval "$(conda shell.bash hook)"   # init conda for non-interactive shell
 conda activate openpi
 
+# === Secrets (HF_TOKEN for private datasets) ===
+if [ -f ~/.openpi_env ]; then
+  source ~/.openpi_env
+fi
+
 export HF_LEROBOT_HOME=/data/gpfs/projects/punim2341/siyuanluo/lerobot_cache
 
 cd /data/gpfs/projects/punim2341/siyuanluo/openpi/openpi
