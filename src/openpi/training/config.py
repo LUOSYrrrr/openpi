@@ -66,6 +66,12 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None# LeRobot 数据集 ID
+    # Optional local dataset location and immutable Hub revision.
+    root: str | None = None
+    revision: str | None = None
+    # Restrict training and normalization statistics to selected episodes.
+    episodes: Sequence[int] | None = None
+    video_backend: str | None = "pyav"
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None # 数据资产目录
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -372,6 +378,8 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 class LeRobotSO101DataConfig(DataConfigFactory):
     """SO-101 single-arm + 2 cameras (top, wrist), 6-DoF + gripper, fps=30."""
 
+    external_camera_key: str = "observation.images.top"
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         # LeRobot v3 raw keys → standard internal keys consumed by SO101Inputs.
@@ -381,10 +389,11 @@ class LeRobotSO101DataConfig(DataConfigFactory):
             inputs=[
                 _transforms.RepackTransform(
                     {
-                        "observation/image.top": "observation.images.top",
+                        "observation/image.top": self.external_camera_key,
                         "observation/image.wrist": "observation.images.wrist",
                         "observation/state": "observation.state",
                         "actions": "action",
+                        "prompt": "prompt",
                     }
                 )
             ]
@@ -858,6 +867,40 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
+    ),
+    # Full JAX fine-tuning on the 100 manually labelled successful battery
+    # insertion demonstrations. The dataset revision and episode selection are
+    # pinned so norm stats and training always use exactly the same samples.
+    TrainConfig(
+        name="pi05_so101_battery",
+        project_name="so101-openpi-baselines",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=True),
+        data=LeRobotSO101DataConfig(
+            repo_id="LUOSYrrrrr/so101_battery_insertion_v2_openpi_v21",
+            external_camera_key="observation.images.third_person",
+            base_config=DataConfig(
+                root=(
+                    "/data/gpfs/projects/punim2341/siyuanluo/lerobot_cache/"
+                    "LUOSYrrrrr/so101_battery_insertion_v2_openpi_v21"
+                ),
+                episodes=tuple(range(100)),
+                prompt_from_task=True,
+                video_backend="pyav",
+            ),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        save_interval=500,
+        keep_period=None,
     ),
     #
     # Fine-tuning Aloha configs.

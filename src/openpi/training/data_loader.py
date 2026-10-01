@@ -173,7 +173,11 @@ def create_torch_dataset(
     #                       → LIBERO 有 40 个 task，task_index=0 是
     #                         "put the white mug on the left plate and..."
     #                       → PromptFromLeRobotTask 查这张表（见步骤 3）
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(
+        repo_id,
+        root=data_config.root,
+        revision=data_config.revision,
+    )
 
     # ---- 步骤 2：构造真正的 LeRobotDataset ----
     # LeRobotDataset 支持懒加载：首次 ds[i] 才下载对应的 episode_XXXXXX.parquet
@@ -193,9 +197,13 @@ def create_torch_dataset(
     # 若要切其他时间序列（如 state 历史），可以加进来。
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        root=data_config.root,
+        episodes=list(data_config.episodes) if data_config.episodes is not None else None,
+        revision=data_config.revision,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        video_backend=data_config.video_backend,
     )
 
     # ---- 步骤 3：（可选）把 task_index 转成自然语言 prompt ----
